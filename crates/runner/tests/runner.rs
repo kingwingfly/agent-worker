@@ -257,6 +257,14 @@ async fn a_turn_streams_events_and_ends_with_the_result() {
         "{args:?}"
     );
     assert!(args.contains(&"mcp__approver__permission_prompt".to_owned()));
+    // The MCP servers are given inline, with the approver at the address really bound.
+    let position = args.iter().position(|arg| arg == "--mcp-config").unwrap();
+    let servers: serde_json::Value = serde_json::from_str(&args[position + 1]).unwrap();
+    assert_eq!(
+        servers["mcpServers"]["approver"]["url"],
+        format!("http://{}/mcp", harness.runner.approver_addr)
+    );
+    assert!(!harness.cfg.runtime_dir.join("mcp.json").exists());
 
     // The process stays up for the next turn; a re-sent message is not run twice.
     user_message(&mut socket, "t1", "hello").await;

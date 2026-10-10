@@ -22,7 +22,7 @@ pub struct Config {
     pub out_dir: PathBuf,
     /// Claude's config directory; transcripts live in `projects/` beneath it.
     pub claude_config_dir: PathBuf,
-    /// Scratch space for generated files such as the MCP config.
+    /// Scratch space for state archives on their way in and out.
     pub runtime_dir: PathBuf,
     /// `--settings` file holding the permission allow-list, if present.
     pub settings: Option<PathBuf>,
@@ -94,7 +94,9 @@ impl Config {
             out_dir: path_var("RUNNER_OUT_DIR", work_dir.join("out")),
             work_dir,
             claude_config_dir: path_var("CLAUDE_CONFIG_DIR", home.join(".claude")),
-            runtime_dir: path_var("RUNNER_RUNTIME_DIR", "/run/agent"),
+            // Under the home directory rather than /run or /tmp: those are often memory
+            // backed or remounted empty when a container starts, and archives are large.
+            runtime_dir: path_var("RUNNER_RUNTIME_DIR", home.join(".cache/agent-runner")),
             settings: existing(path_var("RUNNER_SETTINGS", "/etc/agent/settings.json")),
             system_prompt: existing(path_var("RUNNER_SYSTEM_PROMPT", "/etc/agent/system.md")),
             max_turns: var("RUNNER_MAX_TURNS")
@@ -128,10 +130,6 @@ impl Config {
             .flatten()
             .flatten()
             .any(|project| project.path().join(&file).is_file())
-    }
-
-    pub fn mcp_config_path(&self) -> PathBuf {
-        self.runtime_dir.join("mcp.json")
     }
 
     pub(crate) fn dirs_to_create(&self) -> [&Path; 4] {

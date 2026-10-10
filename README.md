@@ -67,9 +67,11 @@ npx wrangler dev --enable-containers=false \
 
 ## Deploy
 
-Needs a Workers Paid plan, Docker for building the images, and `cargo install worker-build`.
+Needs a Workers Paid plan, Docker or podman for building the images, and `cargo install worker-build`.
 
-1. Edit `[vars]` in `wrangler.toml`: `PUBLIC_ORIGIN`, `LLM_BASE_URL`, `MODEL`, `SMALL_MODEL`, `ALLOWED_TG_USERS`.
+With podman, put `WRANGLER_DOCKER_BIN="$PWD/containers/docker-via-podman"` in front of the `wrangler deploy` command below. The wrapper adapts what podman does differently from Docker: two `build` arguments, and the image digest reported after a push, which wrangler uses to tell Cloudflare what to run. Rootless podman needs subordinate id ranges for your user (`grep "^$USER:" /etc/subuid /etc/subgid`), or installing packages inside the image build fails.
+
+1. Edit `[vars]` in `wrangler.toml`: `PUBLIC_ORIGIN`, `LLM_BASE_URL`, `MODEL`, `SMALL_MODEL`, `ALLOWED_TG_USERS`. `PUBLIC_ORIGIN` must be an address the Worker is really served at, because the agent containers call it for every model and MCP request: either its `workers.dev` address, or your own domain declared under `routes` with `workers_dev = false`.
 2. Create the bucket and set the secrets:
    ```sh
    npx wrangler r2 bucket create agent-worker-state

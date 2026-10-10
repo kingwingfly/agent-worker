@@ -51,15 +51,10 @@ pub async fn start(cfg: Config) -> anyhow::Result<Runner> {
     let addr = listener.local_addr()?;
     let approver_addr = approver_listener.local_addr()?;
 
-    let mcp_config = claude::mcp_config(&cfg, &format!("http://{approver_addr}/mcp"));
-    std::fs::write(
-        cfg.mcp_config_path(),
-        serde_json::to_vec_pretty(&mcp_config)?,
-    )
-    .context("writing MCP config")?;
+    let mcp_config = claude::mcp_config(&cfg, &format!("http://{approver_addr}/mcp")).to_string();
 
     let cfg = Arc::new(cfg);
-    let session = session::spawn(cfg.clone());
+    let session = session::spawn(cfg.clone(), mcp_config);
     let mut servers = JoinSet::new();
     let control = http::router(cfg, session.clone());
     servers.spawn(async move { axum::serve(listener, control).await });

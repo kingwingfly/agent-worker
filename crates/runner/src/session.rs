@@ -91,6 +91,8 @@ struct Turn {
 
 struct Session {
     cfg: Arc<Config>,
+    /// `--mcp-config` JSON for every Claude this session launches.
+    mcp_config: String,
     child_events: mpsc::UnboundedSender<ChildEvent>,
     claude: Option<Claude>,
     /// Bumped on every launch; events from an older process are ignored.
@@ -106,11 +108,12 @@ struct Session {
     pending: HashMap<String, oneshot::Sender<Decision>>,
 }
 
-pub fn spawn(cfg: Arc<Config>) -> SessionHandle {
+pub fn spawn(cfg: Arc<Config>, mcp_config: String) -> SessionHandle {
     let (commands_tx, mut commands) = mpsc::unbounded_channel();
     let (child_events, mut child_rx) = mpsc::unbounded_channel();
     let mut session = Session {
         cfg,
+        mcp_config,
         child_events,
         claude: None,
         generation: 0,
@@ -322,6 +325,7 @@ impl Session {
             let resume = self.cfg.has_transcript();
             match Claude::spawn(
                 &self.cfg,
+                &self.mcp_config,
                 resume,
                 self.generation,
                 self.child_events.clone(),

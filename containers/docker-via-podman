@@ -1,0 +1,85 @@
+#!/bin/sh
+# Lets wrangler build and push the container images with podman instead of Docker:
+#
+#   WRANGLER_DOCKER_BIN=/path/to/containers/docker-via-podman npx wrangler deploy
+#
+# Podman understands the Docker commands wrangler runs. Three things differ, and are
+# adapted here.
+#
+# build:
+#   - wrangler passes BuildKit's --provenance flag, which podman does not have;
+#   - wrangler sends the Dockerfile on stdin (`-f -`) through a socket, and podman reads
+#     it by reopening /dev/stdin, which a socket does not allow. It is saved to a file.
+#
+# push, then `image inspect --format '{{ json .RepoDigests }}'`:
+#   - wrangler deploys the image by the digest the registry gave it, which it reads from
+#     RepoDigests after the push. Docker lists there what registries have confirmed.
+#     Podman lists a digest of the local copy for every name the image has, and that
+#     changes when the layers are compressed for upload, so the registry holds no image
+#     under it (IMAGE_REGISTRY_DOESNT_CONTAIN_IMAGE). The digest the push really produced
+#     is recorded and given as the answer instead.
+
+# Docker's image format, which is what wrangler otherwise hands to the registry.
+export BUILDAH_FORMAT=docker
+
+# Where pushed digests are kept between wrangler's separate invocations of this script.
+pushed="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/docker-via-podman-$(id -u)"
+
+# File a pushed image reference's digest is recorded in.
+record() {
+  printf '%s/%s' "$pushed" "$(printf '%s' "$1" | cksum | tr ' ' '-')"
+}
+
+if [ "$1" = push ] && [ "$#" -eq 2 ]; then
+  mkdir -p "$pushed" && chmod 700 "$pushed"
+  file=$(record "$2")
+  rm -f "$file"
+  podman push --digestfile "$file" "$2"
+  status=$?
+  [ "$status" -eq 0 ] || rm -f "$file"
+  exit $status
+fi
+
+if [ "$1" = image ] && [ "$2" = inspect ] && [ "$4" = --format ]; then
+  file=$(record "$3")
+  case $5 in
+    *RepoDigests*)
+      if [ -s "$file" ]; then
+        # The reference without its tag; a colon before the last slash is a port.
+        repository=${3%@*}
+        case ${repository##*/} in
+          *:*) repository=${repository%:*} ;;
+        esac
+        printf '["%s@%s"]\n' "$repository" "$(cat "$file")"
+        exit 0
+      fi
+      ;;
+  esac
+fi
+
+dockerfile=
+previous=
+for arg do
+  shift
+  case $arg in
+    --provenance=*) ;;
+    -)
+      if [ "$previous" = -f ]; then
+        dockerfile=$(mktemp) && cat > "$dockerfile"
+        set -- "$@" "$dockerfile"
+      else
+        set -- "$@" "$arg"
+      fi
+      ;;
+    *) set -- "$@" "$arg" ;;
+  esac
+  previous=$arg
+done
+
+if [ -z "$dockerfile" ]; then
+  exec podman "$@"
+fi
+podman "$@"
+status=$?
+rm -f "$dockerfile"
+exit $status
