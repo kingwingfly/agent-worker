@@ -669,18 +669,27 @@ impl Inner {
 
     async fn wait_until_ready(&self, cfg: &Config, container: &Container) -> Result<()> {
         let port = container.get_tcp_port(RUNNER_PORT)?;
+        // Kept for the error: the platform's own words say why a container is not
+        // coming up, for instance that none can be provided right after a deployment.
+        let mut last = "its health check never answered".to_owned();
         let mut ready = false;
         for _ in 0..READY_ATTEMPTS {
-            if let Ok(response) = port.fetch("http://runner/healthz", None).await
-                && response.status_code() == 200
-            {
-                ready = true;
-                break;
+            match port.fetch("http://runner/healthz", None).await {
+                Ok(response) if response.status_code() == 200 => {
+                    ready = true;
+                    break;
+                }
+                Ok(response) => {
+                    last = format!("its health check answered {}", response.status_code());
+                }
+                Err(error) => last = error.to_string(),
             }
             Delay::from(Duration::from_millis(READY_POLL_MS)).await;
         }
         if !ready {
-            return Err(error("the agent container did not become ready"));
+            return Err(error(format!(
+                "the agent container did not become ready ({last})"
+            )));
         }
         // Not kept across a restart of this object, hence set on every connection. Best
         // effort: older runtimes may not have the call.

@@ -46,16 +46,22 @@ impl McpHostDO {
         if self.ready.get() {
             return Ok(port);
         }
+        let mut last = String::new();
         for _ in 0..READY_ATTEMPTS {
             // Any HTTP answer, even an error status, means the server is listening.
             let probe = format!("http://localhost:{MCP_PORT}/");
-            if port.fetch(probe, None).await.is_ok() {
-                self.ready.set(true);
-                return Ok(port);
+            match port.fetch(probe, None).await {
+                Ok(_) => {
+                    self.ready.set(true);
+                    return Ok(port);
+                }
+                Err(error) => last = error.to_string(),
             }
             Delay::from(Duration::from_millis(READY_POLL_MS)).await;
         }
-        Err(error("the MCP server did not start listening"))
+        Err(error(format!(
+            "the MCP server did not start listening ({last})"
+        )))
     }
 }
 
