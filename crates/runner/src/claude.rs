@@ -40,7 +40,11 @@ pub struct Claude {
     pid: Option<u32>,
 }
 
-/// Contents of the `--mcp-config` file.
+/// The MCP servers Claude connects to, as `--mcp-config` takes them.
+///
+/// Passed on the command line, not through a file: the agent runs as the same user and
+/// could rewrite a file to point "approver" at a server of its own before Claude is next
+/// launched, and so approve its own requests.
 pub fn mcp_config(cfg: &Config, approver_url: &str) -> Value {
     let mut servers = serde_json::Map::new();
     servers.insert(
@@ -60,8 +64,9 @@ pub fn mcp_config(cfg: &Config, approver_url: &str) -> Value {
     json!({ "mcpServers": servers })
 }
 
-/// Arguments for a long-lived, stream-json driven `claude -p`.
-pub fn args(cfg: &Config, resume: bool) -> Vec<String> {
+/// Arguments for a long-lived, stream-json driven `claude -p`. `mcp_config` is the JSON
+/// from [`mcp_config`].
+pub fn args(cfg: &Config, mcp_config: &str, resume: bool) -> Vec<String> {
     let mut args: Vec<String> = [
         "-p",
         "--input-format",
@@ -86,7 +91,7 @@ pub fn args(cfg: &Config, resume: bool) -> Vec<String> {
         "--tools".into(),
         cfg.tools.clone(),
         "--mcp-config".into(),
-        cfg.mcp_config_path().display().to_string(),
+        mcp_config.to_owned(),
         "--strict-mcp-config".into(),
         // Ignore settings files inside the working directory: the agent can write there
         // and must not be able to grant itself permissions.
@@ -117,13 +122,14 @@ pub fn args(cfg: &Config, resume: bool) -> Vec<String> {
 impl Claude {
     pub fn spawn(
         cfg: &Config,
+        mcp_config: &str,
         resume: bool,
         generation: u64,
         events: mpsc::UnboundedSender<ChildEvent>,
     ) -> anyhow::Result<Self> {
         let mut command = Command::new(&cfg.claude_bin);
         command
-            .args(args(cfg, resume))
+            .args(args(cfg, mcp_config, resume))
             .current_dir(&cfg.work_dir)
             .env("DISABLE_AUTOUPDATER", "1")
             .env("MCP_TOOL_TIMEOUT", MCP_TOOL_TIMEOUT_MS)

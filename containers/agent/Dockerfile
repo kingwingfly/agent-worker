@@ -29,9 +29,12 @@ RUN curl -fsSL "https://github.com/typst/typst/releases/download/v${TYPST_VERSIO
  && curl -fsSL "https://github.com/jgm/pandoc/releases/download/${PANDOC_VERSION}/pandoc-${PANDOC_VERSION}-linux-amd64.tar.gz" \
   | tar -xz --strip-components=2 -C /usr/local/bin "pandoc-${PANDOC_VERSION}/bin/pandoc"
 
+# Everything the agent user writes at run time is under /work or its home directory.
+# Nothing may be prepared under /run: Cloudflare mounts a fresh one over it when the
+# container starts, and the agent user cannot create directories there.
 RUN useradd --create-home --uid 1000 agent \
- && mkdir -p /work/out /run/agent \
- && chown -R agent:agent /work /run/agent
+ && mkdir -p /work/out \
+ && chown -R agent:agent /work
 
 USER agent
 RUN curl -fsSL https://claude.ai/install.sh | bash -s -- "${CLAUDE_CODE_VERSION}"
@@ -45,6 +48,9 @@ COPY containers/agent/md2pdf/md2pdf /usr/local/bin/md2pdf
 COPY containers/agent/md2pdf/defaults.yaml containers/agent/md2pdf/header.typ \
      containers/agent/md2pdf/tidy.lua /etc/agent/md2pdf/
 COPY --chown=agent:agent skills/ /home/agent/.claude/skills/
+# Claude keeps its transcripts and settings here, so it has to own all of it whichever
+# way the builder created the directories above.
+RUN chown -R agent:agent /home/agent/.claude
 
 USER agent
 # Fail the build, not a user's request, if the PDF toolchain does not fit together.
