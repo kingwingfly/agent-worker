@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Skill",
+      "mcp__domain",
+      "Bash(md2pdf *)"
+    ],
+    "disableBypassPermissionsMode": "disable"
+  },
+  "allowManagedPermissionRulesOnly": true,
+  "allowManagedHooksOnly": true
+}
