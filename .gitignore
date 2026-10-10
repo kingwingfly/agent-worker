@@ -30,3 +30,5 @@ rustc-ice-*.txt
 
 # wrangler is installed locally through npm
 node_modules
+
+.worktrees/

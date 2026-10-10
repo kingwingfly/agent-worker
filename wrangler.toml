@@ -1,6 +1,12 @@
 name = "agent-worker"
 main = "crates/gateway/build/index.js"
 compatibility_date = "2026-10-01"
+# Serve at <name>.<subdomain>.workers.dev, which is what PUBLIC_ORIGIN below assumes. To
+# serve from your own domain instead, set this to false and add:
+#   routes = [{ pattern = "agent.example.com", custom_domain = true }]
+workers_dev = true
+# No per-version preview URLs: each would be one more public address for the same Worker.
+preview_urls = false
 
 [build]
 command = "cd crates/gateway && worker-build --release"
