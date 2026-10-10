@@ -1,0 +1,25 @@
+[workspace]
+resolver = "3"
+members = ["crates/proto", "crates/runner", "crates/gateway", "crates/mcp-example"]
+# The gateway is built for wasm32 by `worker-build`; see the README.
+default-members = ["crates/proto", "crates/runner", "crates/mcp-example"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+
+[workspace.dependencies]
+agent-proto = { path = "crates/proto" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
+
+# The Worker ships as wasm, where size matters more than speed.
+[profile.release.package.agent-gateway]
+opt-level = "s"

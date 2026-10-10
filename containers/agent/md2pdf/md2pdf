@@ -1,0 +1,42 @@
+#!/bin/sh
+# md2pdf: render a Markdown file as a PDF.
+#
+#   md2pdf report.md             writes /work/out/report.pdf
+#   md2pdf report.md summary.pdf writes /work/out/summary.pdf
+#
+# An output name containing a directory is used as given. Images are looked up relative
+# to the Markdown file. Page setup and fonts live next to this script's defaults file,
+# so the agent only ever has to write Markdown. On success it prints the path and the
+# page count, which leaves the agent nothing to go and check.
+set -eu
+
+home="${MD2PDF_HOME:-/etc/agent/md2pdf}"
+out_dir="${MD2PDF_OUT_DIR:-/work/out}"
+
+if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
+  echo "usage: md2pdf INPUT.md [OUTPUT.pdf]" >&2
+  exit 2
+fi
+input=$1
+if [ ! -f "$input" ]; then
+  echo "md2pdf: no such file: $input" >&2
+  exit 1
+fi
+
+output=${2:-$(basename "${input%.*}").pdf}
+case $output in
+  /*) ;;
+  */*) output="$PWD/$output" ;;
+  *) output="$out_dir/$output" ;;
+esac
+mkdir -p "$(dirname "$output")"
+
+cd "$(dirname "$input")"
+pandoc --defaults="$home/defaults.yaml" "$(basename "$input")" --output="$output"
+
+pages=$(pdfinfo "$output" 2>/dev/null | awk '/^Pages:/ { print $2 }')
+case $pages in
+  "") echo "wrote $output" ;;
+  1) echo "wrote $output (1 page)" ;;
+  *) echo "wrote $output ($pages pages)" ;;
+esac

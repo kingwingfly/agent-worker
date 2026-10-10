@@ -1,0 +1,68 @@
+name = "agent-worker"
+main = "crates/gateway/build/index.js"
+compatibility_date = "2026-10-01"
+
+[build]
+command = "cd crates/gateway && worker-build --release"
+
+[observability]
+enabled = true
+
+# Secrets, set with `wrangler secret put <NAME>`:
+#   TELEGRAM_BOT_TOKEN       from @BotFather
+#   TELEGRAM_WEBHOOK_SECRET  any random string; also given to Telegram's setWebhook
+#   LLM_API_KEY              credential for the LLM gateway
+#   SESSION_TOKEN_SECRET     any long random string; signs the tokens containers hold
+[vars]
+# Where agent containers reach this Worker.
+PUBLIC_ORIGIN = "https://agent-worker.example.workers.dev"
+# An Anthropic Messages compatible gateway. `/v1/messages` is appended by Claude Code.
+LLM_BASE_URL = "https://llm-gateway.example.com"
+# "bearer" sends `Authorization: Bearer <LLM_API_KEY>`, "x-api-key" sends that header.
+LLM_AUTH_STYLE = "bearer"
+# Model ids as the gateway names them. SMALL_MODEL serves background requests.
+MODEL = "claude-sonnet-5-5"
+SMALL_MODEL = "claude-haiku-5-5"
+# Comma separated Telegram user ids, or "*" for anyone. Empty admits nobody.
+ALLOWED_TG_USERS = ""
+# Seconds an agent container stays warm after answering.
+IDLE_TTL_SECS = "120"
+APPROVAL_TIMEOUT_SECS = "600"
+TURN_TIMEOUT_SECS = "1800"
+# Fresh tokens (cache reads excluded) per chat per UTC day; "0" is unlimited.
+DAILY_TOKEN_BUDGET = "0"
+MCP_IDLE_TTL_SECS = "900"
+
+[[durable_objects.bindings]]
+name = "SESSION"
+class_name = "SessionDO"
+
+[[durable_objects.bindings]]
+name = "MCP_HOST"
+class_name = "McpHostDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SessionDO", "McpHostDO"]
+
+# One agent container per chat with a turn in progress or just finished.
+# max_instances caps how many run at once.
+[[containers]]
+class_name = "SessionDO"
+image = "./containers/agent/Dockerfile"
+image_build_context = "."
+instance_type = "standard-1"
+max_instances = 20
+
+# The MCP server every agent shares.
+[[containers]]
+class_name = "McpHostDO"
+image = "./containers/mcp/Dockerfile"
+image_build_context = "."
+instance_type = "basic"
+max_instances = 1
+
+# Session state archives and the files agents produce.
+[[r2_buckets]]
+binding = "STATE"
+bucket_name = "agent-worker-state"
