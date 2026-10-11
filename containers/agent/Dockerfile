@@ -59,8 +59,11 @@ RUN chown -R agent:agent /home/agent/.claude
 USER agent
 # Fail the build, not a user's request, if the PDF toolchain does not fit together.
 RUN printf '# Check\n\n| a | b |\n|---|---|\n| 中文 | ok |\n' > /tmp/check.md \
- && md2pdf /tmp/check.md /tmp/check.pdf \
- && rm /tmp/check.md /tmp/check.pdf
+ && md2pdf /tmp/check.md check.pdf \
+ && rm /tmp/check.md /work/out/check.pdf
+# md2pdf runs without the user being asked, so it has to refuse a file whose name pandoc
+# would take for an option, before it starts pandoc.
+RUN touch /tmp/-check.md; md2pdf /tmp/-check.md 2>/dev/null; [ "$?" -eq 1 ] && rm /tmp/-check.md
 # The file helper has to be runnable, and to refuse what is not a file before it
 # contacts anything.
 RUN mcp-file get .. 2>/dev/null; [ "$?" -eq 1 ]
