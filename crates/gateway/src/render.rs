@@ -4,6 +4,7 @@
 //!
 //! Nothing here touches the network, so it is tested on the host.
 
+use agent_proto::Effort;
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use serde_json::{Value, json};
 
@@ -22,6 +23,11 @@ const PROMPT_INPUT_LIMIT: usize = 1500;
 const PICK_LABEL_CHARS: usize = 36;
 /// How much of a message is quoted back once it has been picked.
 const PICKED_TEXT_LIMIT: usize = 1500;
+/// What an effort setting is called while it is left to the model, as in Claude Code.
+const AUTO_EFFORT: &str = "auto";
+/// Starts the callback data of an `/effort` button, as `p`, `q`, `s` and `r` start the
+/// other kinds.
+const EFFORT_PREFIX: &str = "e:";
 
 /// Headings of the progress message: while a turn runs, and for each way it can end.
 pub const WORKING: &str = "⏳ Working…";
@@ -719,6 +725,57 @@ pub fn rewound(text: &str) -> String {
     )
 }
 
+/// How an effort setting is written: its level, or `auto` when none is set and the
+/// model's own default applies.
+pub fn effort_name(effort: Option<Effort>) -> &'static str {
+    effort.map_or(AUTO_EFFORT, Effort::as_str)
+}
+
+/// The setting `word` names, as typed after `/effort`. `None` if it names none.
+pub fn parse_effort(word: &str) -> Option<Option<Effort>> {
+    if word.eq_ignore_ascii_case(AUTO_EFFORT) {
+        Some(None)
+    } else {
+        Effort::parse(word).map(Some)
+    }
+}
+
+/// The setting a pressed button of the `/effort` list stands for.
+pub fn picked_effort(data: &str) -> Option<Option<Effort>> {
+    data.strip_prefix(EFFORT_PREFIX).and_then(parse_effort)
+}
+
+/// The `/effort` list: every level and `auto`, with the one in use marked.
+pub fn effort_picker(current: Option<Effort>) -> (String, Value) {
+    let html = format!(
+        "🧠 <b>Effort: {}</b>\n\
+         How much work I put into an answer. More takes longer and uses more tokens; \
+         <code>{AUTO_EFFORT}</code> leaves it to the model.",
+        effort_name(current)
+    );
+    let buttons: Vec<Value> = Effort::ALL
+        .into_iter()
+        .map(Some)
+        .chain([None])
+        .map(|effort| {
+            let name = effort_name(effort);
+            let mark = if effort == current { "● " } else { "" };
+            json!({ "text": format!("{mark}{name}"), "callback_data": format!("{EFFORT_PREFIX}{name}") })
+        })
+        .collect();
+    let rows: Vec<&[Value]> = buttons.chunks(3).collect();
+    (html, json!({ "inline_keyboard": rows }))
+}
+
+/// What to say once `/effort` has set something, and what its list turns into once a
+/// button has been pressed. A turn that is running keeps the level it started at.
+pub fn effort_set(effort: Option<Effort>) -> String {
+    format!(
+        "🧠 <b>Effort: {}</b>\nIt applies from your next message.",
+        effort_name(effort)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -830,6 +887,55 @@ mod tests {
             resumed(&saved[1], Some("Plan the outing")),
             "💬 <b>Resumed</b>\n<i>Plan the outing</i>"
         );
+    }
+
+    #[test]
+    fn effort_is_picked_from_a_list_that_marks_the_level_in_use() {
+        let labels = |keyboard: &Value| -> Vec<Vec<String>> {
+            let rows = keyboard["inline_keyboard"].as_array().unwrap();
+            let label = |button: &Value| button["text"].as_str().unwrap().to_owned();
+            rows.iter()
+                .map(|row| row.as_array().unwrap().iter().map(label).collect())
+                .collect()
+        };
+        let (html, keyboard) = effort_picker(Some(Effort::High));
+        assert!(html.starts_with("🧠 <b>Effort: high</b>\n"), "{html}");
+        assert_eq!(
+            labels(&keyboard),
+            [["low", "medium", "● high"], ["xhigh", "max", "auto"]]
+        );
+        let (html, keyboard) = effort_picker(None);
+        assert!(html.starts_with("🧠 <b>Effort: auto</b>\n"), "{html}");
+        assert_eq!(labels(&keyboard)[1], ["xhigh", "max", "● auto"]);
+
+        // Each button comes back as the setting it shows, and as no other kind of button.
+        let settings = Effort::ALL.into_iter().map(Some).chain([None]);
+        let buttons = keyboard["inline_keyboard"].as_array().unwrap().iter();
+        for (button, setting) in buttons
+            .flat_map(|row| row.as_array().unwrap())
+            .zip(settings)
+        {
+            let data = button["callback_data"].as_str().unwrap();
+            assert_eq!(picked_effort(data), Some(setting), "{data}");
+            assert_eq!(Pick::parse(data), None);
+            assert_eq!(Callback::parse(data), None);
+        }
+        for data in ["e:extreme", "e:", "high", "s:high"] {
+            assert_eq!(picked_effort(data), None, "{data}");
+        }
+    }
+
+    #[test]
+    fn effort_can_be_named_after_the_command() {
+        assert_eq!(parse_effort("xhigh"), Some(Some(Effort::Xhigh)));
+        assert_eq!(parse_effort("Max"), Some(Some(Effort::Max)));
+        assert_eq!(parse_effort("auto"), Some(None));
+        assert_eq!(parse_effort("extreme"), None);
+        assert_eq!(
+            effort_set(Some(Effort::Low)),
+            "🧠 <b>Effort: low</b>\nIt applies from your next message."
+        );
+        assert!(effort_set(None).starts_with("🧠 <b>Effort: auto</b>"));
     }
 
     #[test]

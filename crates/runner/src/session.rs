@@ -9,7 +9,7 @@ use std::{
     sync::Arc,
 };
 
-use agent_proto::{Decision, FromRunner, ToRunner, TurnResult};
+use agent_proto::{Decision, Effort, FromRunner, ToRunner, TurnResult};
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
@@ -78,6 +78,8 @@ impl SessionHandle {
 struct Turn {
     id: String,
     text: String,
+    /// The level the message is to be answered at.
+    effort: Option<Effort>,
     /// Identifies the user message in Claude's stream.
     message_uuid: String,
     /// Claude has picked the message up, so the next `result` is its answer.
@@ -172,9 +174,11 @@ impl Session {
                 });
                 self.connection = Some(connection);
             }
-            Command::Frame(ToRunner::UserMessage { turn_id, text }) => {
-                self.start_turn(turn_id, text).await
-            }
+            Command::Frame(ToRunner::UserMessage {
+                turn_id,
+                text,
+                effort,
+            }) => self.start_turn(turn_id, text, effort).await,
             Command::Frame(ToRunner::PermissionDecision {
                 request_id,
                 decision,
@@ -212,6 +216,9 @@ impl Session {
     async fn on_child_event(&mut self, event: ChildEvent) {
         match event {
             ChildEvent::Line { generation, line } if generation == self.generation => {
+                if let Some(reason) = claude::refused_control_request(&line) {
+                    tracing::warn!("claude refused a change of effort: {reason}");
+                }
                 let Some(turn) = &mut self.turn else {
                     tracing::debug!("dropping claude output outside a turn");
                     return;
@@ -285,7 +292,7 @@ impl Session {
             .unwrap_or_default()
     }
 
-    async fn start_turn(&mut self, turn_id: String, text: String) {
+    async fn start_turn(&mut self, turn_id: String, text: String, effort: Option<Effort>) {
         let running = self.turn.as_ref().map(|turn| turn.id.as_str());
         // The Durable Object re-sends a message it is not sure was delivered.
         if running == Some(turn_id.as_str()) || self.last_turn.as_deref() == Some(turn_id.as_str())
@@ -306,6 +313,7 @@ impl Session {
         self.turn = Some(Turn {
             id: turn_id,
             text,
+            effort,
             message_uuid: uuid::Uuid::new_v4().to_string(),
             acknowledged: false,
             resent: false,
@@ -319,6 +327,7 @@ impl Session {
     async fn deliver(&mut self) {
         let Some(turn) = &self.turn else { return };
         let (message_uuid, text) = (turn.message_uuid.clone(), turn.text.clone());
+        let effort = turn.effort;
 
         if self.claude.is_none() {
             self.generation += 1;
@@ -327,6 +336,7 @@ impl Session {
                 &self.cfg,
                 &self.mcp_config,
                 resume,
+                effort,
                 self.generation,
                 self.child_events.clone(),
             ) {
@@ -342,7 +352,12 @@ impl Session {
             }
         }
         let claude = self.claude.as_mut().expect("claude was just started");
-        if let Err(error) = claude.send_user_message(&message_uuid, &text).await {
+        // A process that was launched for an earlier turn may be at another level.
+        let written = match claude.set_effort(effort).await {
+            Ok(()) => claude.send_user_message(&message_uuid, &text).await,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = written {
             // The process is gone or going. Make sure of it; its exit event then decides
             // whether the message is sent again or the turn fails.
             tracing::warn!(%error, "could not write to claude");

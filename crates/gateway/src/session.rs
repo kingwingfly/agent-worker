@@ -10,7 +10,7 @@
 use std::{cell::RefCell, rc::Rc, time::Duration};
 
 use agent_proto::{
-    ASK_USER_QUESTION, Artifact, Decision, FromRunner, RUNNER_PORT, ToRunner, TurnResult,
+    ASK_USER_QUESTION, Artifact, Decision, Effort, FromRunner, RUNNER_PORT, ToRunner, TurnResult,
     env as runner_env,
     token::{self, Claims},
 };
@@ -76,6 +76,7 @@ const HELP: &str = "Send me a message and I'll get to work.\n\n\
     /new — start a fresh conversation\n\
     /resume — go back to an earlier conversation\n\
     /rewind — go back to before one of your messages\n\
+    /effort — how much work I put into an answer\n\
     /stop — stop what I'm doing\n\
     /status — what I'm doing and today's usage";
 
@@ -106,6 +107,10 @@ struct Session {
     turn: Option<Turn>,
     /// When a warm, idle container is stopped.
     idle_deadline_ms: u64,
+    /// The level `/effort` set, which every turn of this chat is answered at, in whatever
+    /// conversation. `None` leaves it to the model's default.
+    #[serde(default)]
+    effort: Option<Effort>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -406,6 +411,7 @@ impl Inner {
             Some("/new") => (self.reset().await?, None),
             Some("/resume") => self.offer_resume()?,
             Some("/rewind") => self.offer_rewind()?,
+            Some("/effort") => self.on_effort(text.split_whitespace().nth(1)),
             Some("/stop") => (self.stop(cfg, bot).await, None),
             Some("/status") => (self.describe(cfg)?, None),
             Some(other) => (
@@ -596,17 +602,40 @@ impl Inner {
                 .answer_callback(&query.id, Some("This is no longer open."))
                 .await;
         };
+        self.close_list(bot, query, &html).await
+    }
+
+    /// Turns a list into the record of what was picked from it.
+    async fn close_list(&self, bot: &Bot, query: &CallbackQuery, html: &str) -> Result<()> {
         let _ = bot.answer_callback(&query.id, None).await;
-        // The list turns into the record of what was picked from it.
         match &query.message {
             Some(list) => {
-                bot.edit_message(self.chat_id(), list.message_id, &html, None)
+                bot.edit_message(self.chat_id(), list.message_id, html, None)
                     .await
             }
-            None => bot
-                .send_message(self.chat_id(), &html, None)
-                .await
-                .map(drop),
+            None => bot.send_message(self.chat_id(), html, None).await.map(drop),
+        }
+    }
+
+    /// `/effort`: sets the level named after the command, or lists them to pick from.
+    /// Nothing has to be stopped for it: the level is handed over with each message, so
+    /// it is the next turn that sees it.
+    fn on_effort(&self, named: Option<&str>) -> (String, Option<Value>) {
+        let picker = || render::effort_picker(self.session.borrow().effort);
+        let Some(word) = named else {
+            let (html, keyboard) = picker();
+            return (html, Some(keyboard));
+        };
+        match render::parse_effort(word) {
+            Some(effort) => {
+                self.update(|session| session.effort = effort);
+                (render::effort_set(effort), None)
+            }
+            None => {
+                let (html, keyboard) = picker();
+                let unknown = format!("I don't know the level {}.", render::escape(word));
+                (format!("{unknown}\n\n{html}"), Some(keyboard))
+            }
         }
     }
 
@@ -752,6 +781,8 @@ impl Inner {
             }
             None => lines.push("Idle.".into()),
         }
+        let effort = self.session.borrow().effort;
+        lines.push(format!("Effort: {}.", render::effort_name(effort)));
         let used = self.store.usage(today())?;
         lines.push(match cfg.daily_token_budget {
             0 => format!("Tokens used today: {used}."),
@@ -830,6 +861,7 @@ impl Inner {
         let handed_over = self.send(&ToRunner::UserMessage {
             turn_id: turn.id,
             text: turn.text,
+            effort: self.session.borrow().effort,
         });
         if !handed_over {
             return Err(error("the control connection dropped"));
@@ -1268,6 +1300,12 @@ impl Inner {
     ) -> Result<()> {
         if let Some(pick) = query.data.as_deref().and_then(Pick::parse) {
             return self.on_pick(bot, &query, pick).await;
+        }
+        if let Some(effort) = query.data.as_deref().and_then(render::picked_effort) {
+            self.update(|session| session.effort = effort);
+            return self
+                .close_list(bot, &query, &render::effort_set(effort))
+                .await;
         }
         let callback = query.data.as_deref().and_then(Callback::parse);
         let approval = match &callback {

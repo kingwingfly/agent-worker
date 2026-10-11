@@ -12,7 +12,14 @@ use serde_json::Value;
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ToRunner {
     /// Start a turn. Ignored if `turn_id` is the turn already running or last finished.
-    UserMessage { turn_id: String, text: String },
+    UserMessage {
+        turn_id: String,
+        text: String,
+        /// The level to answer at. `None` leaves it to the CLI, which has a default for
+        /// each model.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<Effort>,
+    },
     /// Answer to a [`FromRunner::PermissionRequest`].
     PermissionDecision {
         request_id: String,
@@ -24,6 +31,41 @@ pub enum ToRunner {
     Ack { seq: u64 },
     /// Replay every buffered frame with a sequence number greater than `after_seq`.
     Resume { after_seq: u64 },
+}
+
+/// How much work the model puts into an answer. The names are the CLI's own, for
+/// `--effort` and for its `effortLevel` setting. It ignores a name it does not know
+/// without saying so, so they have to stay exactly that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Effort {
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+impl Effort {
+    /// Every level, from the least work to the most.
+    pub const ALL: [Self; 5] = [Self::Low, Self::Medium, Self::High, Self::Xhigh, Self::Max];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+
+    /// The level called `name`, however it is capitalised.
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|level| level.as_str().eq_ignore_ascii_case(name))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -168,6 +210,37 @@ mod tests {
                 updated_input: None
             }
         );
+    }
+
+    #[test]
+    fn a_user_message_names_an_effort_only_when_one_is_set() {
+        let message = |effort| ToRunner::UserMessage {
+            turn_id: "t".into(),
+            text: "hi".into(),
+            effort,
+        };
+        let plain = json!({ "type": "user_message", "turn_id": "t", "text": "hi" });
+        assert_eq!(serde_json::to_value(message(None)).unwrap(), plain);
+        // Which is also all that a Worker from before there were levels sends.
+        assert_eq!(
+            serde_json::from_value::<ToRunner>(plain).unwrap(),
+            message(None)
+        );
+        let high = serde_json::to_value(message(Some(Effort::High))).unwrap();
+        assert_eq!(high["effort"], "high");
+        assert_eq!(
+            serde_json::from_value::<ToRunner>(high).unwrap(),
+            message(Some(Effort::High))
+        );
+    }
+
+    #[test]
+    fn effort_levels_are_spelled_in_frames_as_on_the_command_line() {
+        for level in Effort::ALL {
+            assert_eq!(serde_json::to_value(level).unwrap(), level.as_str());
+            assert_eq!(Effort::parse(&level.as_str().to_uppercase()), Some(level));
+        }
+        assert_eq!(Effort::parse("auto"), None);
     }
 
     #[test]

@@ -2,6 +2,7 @@
 
 use std::{collections::VecDeque, path::PathBuf, process::Stdio, sync::Arc};
 
+use agent_proto::Effort;
 use anyhow::Context;
 use nix::{
     sys::signal::{Signal, kill},
@@ -38,6 +39,8 @@ pub enum ChildEvent {
 pub struct Claude {
     stdin: ChildStdin,
     pid: Option<u32>,
+    /// The level it answers at: the one it was launched with, until it is told another.
+    effort: Option<Effort>,
 }
 
 /// The MCP servers Claude connects to, as `--mcp-config` takes them.
@@ -65,8 +68,8 @@ pub fn mcp_config(cfg: &Config, approver_url: &str) -> Value {
 }
 
 /// Arguments for a long-lived, stream-json driven `claude -p`. `mcp_config` is the JSON
-/// from [`mcp_config`].
-pub fn args(cfg: &Config, mcp_config: &str, resume: bool) -> Vec<String> {
+/// from [`mcp_config`]. Without an `effort` the CLI picks its default for the model.
+pub fn args(cfg: &Config, mcp_config: &str, resume: bool, effort: Option<Effort>) -> Vec<String> {
     let mut args: Vec<String> = [
         "-p",
         "--input-format",
@@ -112,6 +115,9 @@ pub fn args(cfg: &Config, mcp_config: &str, resume: bool) -> Vec<String> {
     if let Some(model) = &cfg.model {
         args.extend(["--model".into(), model.clone()]);
     }
+    if let Some(effort) = effort {
+        args.extend(["--effort".into(), effort.as_str().into()]);
+    }
     args.extend([
         if resume { "--resume" } else { "--session-id" }.into(),
         cfg.session_id.clone(),
@@ -124,12 +130,13 @@ impl Claude {
         cfg: &Config,
         mcp_config: &str,
         resume: bool,
+        effort: Option<Effort>,
         generation: u64,
         events: mpsc::UnboundedSender<ChildEvent>,
     ) -> anyhow::Result<Self> {
         let mut command = Command::new(&cfg.claude_bin);
         command
-            .args(args(cfg, mcp_config, resume))
+            .args(args(cfg, mcp_config, resume, effort))
             .current_dir(&cfg.work_dir)
             .env("DISABLE_AUTOUPDATER", "1")
             .env("MCP_TOOL_TIMEOUT", MCP_TOOL_TIMEOUT_MS)
@@ -169,20 +176,49 @@ impl Claude {
         let stdin = child.stdin.take().expect("stdin is piped");
         let pid = child.id();
         tokio::spawn(read_output(child, generation, events));
-        Ok(Self { stdin, pid })
+        Ok(Self { stdin, pid, effort })
+    }
+
+    async fn write_line(&mut self, line: &Value) -> std::io::Result<()> {
+        let mut line = serde_json::to_vec(line)?;
+        line.push(b'\n');
+        self.stdin.write_all(&line).await?;
+        self.stdin.flush().await
+    }
+
+    /// Has the messages sent after this answered at `effort`, where `None` is the CLI's
+    /// default for the model. Nothing is written to a process that is at that level
+    /// already.
+    ///
+    /// Claude reads its input in order, so the change is in place before the next message
+    /// without waiting for the `control_response`; see [`refused_control_request`].
+    pub async fn set_effort(&mut self, effort: Option<Effort>) -> std::io::Result<()> {
+        if effort == self.effort {
+            return Ok(());
+        }
+        self.write_line(&json!({
+            "type": "control_request",
+            "request_id": uuid::Uuid::new_v4().to_string(),
+            "request": {
+                "subtype": "apply_flag_settings",
+                // `null` takes the setting away again, `--effort` included.
+                "settings": { "effortLevel": effort },
+            },
+        }))
+        .await?;
+        self.effort = effort;
+        Ok(())
     }
 
     /// Queues a user message. Claude echoes it back under `uuid` when it starts on it and
     /// ends its answer with a `result` message.
     pub async fn send_user_message(&mut self, uuid: &str, text: &str) -> std::io::Result<()> {
-        let mut line = serde_json::to_vec(&json!({
+        self.write_line(&json!({
             "type": "user",
             "uuid": uuid,
             "message": { "role": "user", "content": [{ "type": "text", "text": text }] },
-        }))?;
-        line.push(b'\n');
-        self.stdin.write_all(&line).await?;
-        self.stdin.flush().await
+        }))
+        .await
     }
 
     /// Ends the running turn the way Ctrl-C would. Claude still records a result for it.
@@ -210,6 +246,15 @@ impl Claude {
 /// acknowledgment belongs to the message.
 pub fn is_replay_of(line: &Value, uuid: &str) -> bool {
     line["type"] == "user" && line["isReplay"] == true && line["uuid"] == uuid
+}
+
+/// Why Claude did not do what a control request asked, if `line` is its answer to one and
+/// says so. The only such request is the one in [`Claude::set_effort`], and a CLI that
+/// stopped taking it would otherwise go on at the old level without a word.
+pub fn refused_control_request(line: &Value) -> Option<&str> {
+    let response = &line["response"];
+    (line["type"] == "control_response" && response["subtype"] == "error")
+        .then(|| response["error"].as_str().unwrap_or("no reason given"))
 }
 
 /// Forwards stdout line by line, then reports how the process ended. Sending the exit

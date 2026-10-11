@@ -46,6 +46,12 @@ All three replace the container, so the next message starts one from the checkpo
 
 An alarm re-checks every 30 seconds while a turn is open, so an evicted Durable Object or a crashed container is picked up and the turn is run again. A new container is given the saved state before it runs anything; if that fails the turn is refused rather than run on an empty disk, and the saved copy is left as it is.
 
+### Effort
+
+`/effort` is Claude Code's command of that name. On its own it lists the levels as buttons (`low`, `medium`, `high`, `xhigh`, `max`, and `auto` for the model's default), and `/effort high` sets one directly. The level belongs to the chat: the session keeps it, so it outlasts containers and `/new`, and `/status` shows it.
+
+The session hands the level to the runner with each message. A new `claude` is launched with `--effort`. One that is already running at another level is told just before the message, with the stream-json control request `apply_flag_settings` (`effortLevel`), so nothing is restarted and a change costs no time. Claude Code puts the level into every model call as `output_config.effort`, and it does that without `/effort` too, with its own default for the model; what a level changes is up to the model behind the gateway. A higher level uses more tokens, which count against `DAILY_TOKEN_BUDGET` like any others.
+
 ## Develop
 
 ```sh
@@ -61,7 +67,7 @@ RUNNER_WORK_DIR=/tmp/agent/work RUNNER_RUNTIME_DIR=/tmp/agent/run \
 cargo run -p agent-runner --example drive -- "Create out/hello.md containing one line: hi"
 ```
 
-`drive` approves permission requests (`--deny` to decline, `--interrupt-after-ms N` to interrupt, `--raw` for every frame). Without `AGENT_WORKER_ORIGIN` the CLI uses whatever credentials it already has.
+`drive` approves permission requests (`--deny` to decline, `--interrupt-after-ms N` to interrupt, `--effort LEVEL` to answer at a level, `--raw` for every frame). Without `AGENT_WORKER_ORIGIN` the CLI uses whatever credentials it already has.
 
 ### Run the Worker without a container engine
 
@@ -190,7 +196,9 @@ To try a change without building the image, install pandoc and Typst and run `MD
 
 ## Upgrading Claude Code
 
-The runner relies on `--permission-prompt-tool`, `--input-format stream-json`, `--replay-user-messages` and `--resume`. After changing `CLAUDE_CODE_VERSION`, run the runner against the new CLI and check with `drive` that: a non-approved Bash command produces a permission request and runs when allowed; a second prompt in the same run gets its own result; an interrupt ends the turn and the next prompt still works; restarting the runner resumes the conversation.
+The runner relies on `--permission-prompt-tool`, `--input-format stream-json`, `--replay-user-messages`, `--resume`, `--effort` and the `apply_flag_settings` control request. After changing `CLAUDE_CODE_VERSION`, run the runner against the new CLI and check with `drive` that: a non-approved Bash command produces a permission request and runs when allowed; a second prompt in the same run gets its own result; an interrupt ends the turn and the next prompt still works; restarting the runner resumes the conversation; a `drive --raw --effort high` after a run without `--effort` shows a `control_response` whose `subtype` is `success`.
+
+Check as well that `claude --help` still lists the levels of `Effort` in `crates/proto` for `--effort`. The CLI accepts a level it does not know without an error and goes on at its default, so a renamed level would not show anywhere else.
 
 ## Not built yet
 
