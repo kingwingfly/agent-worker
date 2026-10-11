@@ -27,7 +27,7 @@ Telegram ──webhook──▶ Worker
 
 1. Telegram calls `/tg/webhook`. The Worker checks the webhook secret and the user allow-list and hands the update to the chat's `SessionDO`.
 2. The session starts its container if needed, restores the previous files and transcript from R2, and opens a WebSocket to the runner.
-3. The runner feeds the message to a long-lived `claude -p --input-format stream-json` and streams events back. The session edits a status message as it goes.
+3. The runner feeds the message to a long-lived `claude -p --input-format stream-json` and streams events back. The session shows the tools Claude uses, and what it says before using them, in one progress message that it edits as it goes and leaves in the chat.
 4. A tool call that the policy does not pre-approve reaches the runner's `permission_prompt` MCP tool (`--permission-prompt-tool`). It becomes a Telegram message with **Allow / Always / Deny** buttons; Claude waits for the answer. `AskUserQuestion` arrives the same way and is shown as option buttons.
 5. When the turn ends, the answer is sent, files written to `/work/out/` are delivered as documents, and the state is saved to R2. The container is stopped after `IDLE_TTL_SECS`.
 
