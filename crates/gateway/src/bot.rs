@@ -6,7 +6,11 @@ use serde_json::{Value, json};
 use wasm_bindgen::JsValue;
 use worker::{Delay, Fetch, Headers, Method, Request, RequestInit, Result, js_sys::Uint8Array};
 
-use crate::{config::Config, platform::error, render, scrub};
+use crate::{
+    config::Config,
+    platform::{error, random_uuid},
+    render, scrub,
+};
 
 const RATE_LIMIT_RETRIES: u32 = 2;
 /// Longer waits are not sat out: the caller is usually holding up a session's event loop.
@@ -136,23 +140,26 @@ impl Bot {
     }
 
     pub async fn send_document(&self, chat_id: i64, file_name: &str, bytes: &[u8]) -> Result<()> {
-        const BOUNDARY: &str = "agent-worker-7f3a9c1e5b2d4860";
+        // Made up for this upload alone. The file is whatever an agent wrote, and one
+        // that contained a boundary known beforehand would end its own part early and
+        // have the rest of it read as further fields of the request.
+        let boundary = format!("agent-worker-{}", random_uuid());
         let file_name: String = file_name
             .chars()
             .map(|c| if c == '"' || c.is_control() { '_' } else { c })
             .collect();
         let head = format!(
-            "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{chat_id}\r\n\
-             --{BOUNDARY}\r\nContent-Disposition: form-data; name=\"document\"; \
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{chat_id}\r\n\
+             --{boundary}\r\nContent-Disposition: form-data; name=\"document\"; \
              filename=\"{file_name}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
         );
-        let tail = format!("\r\n--{BOUNDARY}--\r\n");
+        let tail = format!("\r\n--{boundary}--\r\n");
         let mut body = Vec::with_capacity(head.len() + bytes.len() + tail.len());
         body.extend_from_slice(head.as_bytes());
         body.extend_from_slice(bytes);
         body.extend_from_slice(tail.as_bytes());
 
-        let content_type = format!("multipart/form-data; boundary={BOUNDARY}");
+        let content_type = format!("multipart/form-data; boundary={boundary}");
         let body = Uint8Array::from(body.as_slice()).into();
         self.post("sendDocument", &content_type, body)
             .await
