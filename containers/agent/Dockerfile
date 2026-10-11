@@ -54,9 +54,21 @@ COPY containers/agent/md2pdf/defaults.yaml containers/agent/md2pdf/header.typ \
 COPY --chown=agent:agent skills/ /home/agent/.claude/skills/
 # Claude keeps its transcripts and settings here, so it has to own all of it whichever
 # way the builder created the directories above.
-RUN chown -R agent:agent /home/agent/.claude
+#
+# The modes of everything copied from the checkout are set here too, and not taken from
+# it. COPY keeps the mode a file has on the machine that builds the image, so a file
+# closed to the other users of that machine, as an operator may want a system prompt to
+# be, arrived closed to the agent, which is not root. Claude Code does not start
+# without a prompt file or a settings file it was told to read.
+RUN chown -R agent:agent /home/agent/.claude \
+ && chmod -R u=rwX,go=rX /etc/claude-code /etc/agent /home/agent/.claude/skills \
+ && chmod 755 /usr/local/bin/md2pdf /usr/local/bin/mcp-file
 
 USER agent
+# Fail the build, not every request, if a file added above later is one the agent cannot
+# read.
+RUN closed=$(find /etc/claude-code /etc/agent /home/agent/.claude ! -readable) \
+ && [ -z "$closed" ] || { echo "the agent cannot read: $closed" >&2; exit 1; }
 # Fail the build, not a user's request, if the PDF toolchain does not fit together. The
 # picture is there because header.typ measures every picture to decide its size.
 RUN printf '<svg xmlns="http://www.w3.org/2000/svg" width="900" height="1600"/>' > /tmp/check.svg \

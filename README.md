@@ -122,7 +122,7 @@ With podman, put `WRANGLER_DOCKER_BIN="$PWD/containers/docker-via-podman"` in fr
    npx wrangler secret put LLM_API_KEY
    npx wrangler secret put SESSION_TOKEN_SECRET      # a random string of 16 characters or more
    ```
-3. `npx wrangler deploy`. The first deploy builds and pushes both images, which takes a few minutes.
+3. `npx wrangler deploy`. The first deploy builds and pushes both images, which takes a few minutes. The agent image sets the modes of the files it takes from the checkout itself, so you can close `containers/agent/system.md` or a skill to the other users of the machine you build on; the agent, which is not root in its container, reads them all the same.
 4. Register the webhook with the same secret:
    ```sh
    curl "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/setWebhook" \
@@ -214,6 +214,7 @@ To try a change without building the image, install pandoc and Typst and run `MD
 - The agent can read that token, so holding it is not enough. Before acting on one, the proxy asks the chat's session, which refuses a token that is not the one its running container was started with: a token stops working when its container is stopped or replaced, well before its 24 hours are up. For a model call the session also refuses once the day's budget is used up, and the proxy passes on only the two requests Claude Code makes, for the two configured models. What is left to someone who copies a token out is what the agent itself could do: model calls on the chat's budget and the chat's MCP calls, while the container runs.
 - The runner's control API needs a secret the session sets before any agent process exists, and the runner makes its own memory unreadable to the agent, so the agent cannot approve its own prompts.
 - The permission policy is a root-owned managed settings file. Settings the agent writes in its working directory are not loaded.
+- The system prompt and the skills are not secret from the people who chat. They are in the agent image, the agent has to read them to work, and reading needs no approval, so it can be asked to show them. Closing those files on the machine that builds the image protects that copy and nothing else.
 - Containers currently have outbound internet access. An approved shell command can therefore send data anywhere; keep the pre-approved list short. A command on that list runs with whatever arguments the agent gives it, so it has to be safe with all of them, as `md2pdf` and `mcp-file` are meant to be. The `domain` MCP server is pre-approved as a whole: if its tools return text written by third parties, that text can steer the agent into calling them, and no prompt stands in between.
 - A permission prompt shows what is being approved, and all of it: a request too long for the message is attached as a file. The file of an output document is uploaded to Telegram under a boundary made up for that upload, so its content cannot add to the request.
 - `SESSION_TOKEN_SECRET` must be at least 16 characters and no secret may be empty; the Worker answers 500 to everything until that is so. A short signing key could be found by trying keys against a token, and an empty webhook secret is what a request without the header presents.
