@@ -1,6 +1,6 @@
-//! The two routes agent containers call: `/llm/*` to the LLM gateway and `/mcp` to the
-//! shared MCP server. Both accept only a valid session token and replace it with the real
-//! upstream credential or identity, so no upstream secret ever enters a container.
+//! The routes agent containers call: `/llm/*` to the LLM gateway, and `/mcp` and `/file`
+//! to the shared MCP container. All accept only a valid session token and replace it with
+//! the real upstream credential or identity, so no upstream secret ever enters a container.
 
 use agent_proto::{
     Usage,
@@ -157,7 +157,8 @@ async fn meter(mut copy: Response, session: Stub) -> Result<()> {
     session.fetch_with_request(report).await.map(drop)
 }
 
-/// `ANY /mcp[/...]` → the shared MCP container, by way of its Durable Object.
+/// `ANY /mcp[/...]` and `/file` → the shared MCP container, by way of its Durable Object.
+/// The path is kept, and the container's own proxy tells the two apart.
 pub async fn mcp(request: Request, env: &Env, cfg: &Config) -> Result<Response> {
     let Some(claims) = authenticate(&request, cfg)? else {
         return unauthorized();
@@ -167,16 +168,19 @@ pub async fn mcp(request: Request, env: &Env, cfg: &Config) -> Result<Response> 
         .query()
         .map(|query| format!("?{query}"))
         .unwrap_or_default();
-    // `localhost` is what an rmcp server accepts as `Host` out of the box.
-    let target = format!(
-        "http://localhost:{}{}{query}",
-        agent_proto::MCP_PORT,
-        url.path()
-    );
+    let base = match &cfg.dev_mcp_url {
+        Some(url) => url.clone(),
+        // `localhost` is what an rmcp server accepts as `Host` out of the box.
+        None => format!("http://localhost:{}", agent_proto::MCP_PORT),
+    };
+    let target = format!("{base}{}{query}", url.path());
 
     let headers = forwarded_headers(&request)?;
     headers.set(SESSION_HEADER, &claims.session)?;
     let forwarded = retarget(request, &target, headers).await?;
+    if cfg.dev_mcp_url.is_some() {
+        return Fetch::Request(forwarded).send().await;
+    }
     env.durable_object(MCP_BINDING)?
         .get_by_name(MCP_INSTANCE)?
         .fetch_with_request(forwarded)

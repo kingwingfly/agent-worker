@@ -1,7 +1,7 @@
 //! The Cloudflare Worker in front of everything.
 //!
 //! - `POST /tg/webhook` takes Telegram updates and hands each to its chat's `SessionDO`.
-//! - `/llm/*` and `/mcp` are what agent containers call; see [`proxy`].
+//! - `/llm/*`, `/mcp` and `/file` are what agent containers call; see [`proxy`].
 //!
 //! Everything is built for the host as well as for wasm32, so editors and `cargo test`
 //! see the whole crate. Only `metering`, `remember`, `render` and `update` can actually
@@ -50,11 +50,19 @@ async fn fetch(request: Request, env: Env, ctx: Context) -> Result<Response> {
     match path.as_str() {
         "/tg/webhook" if request.method() == Method::Post => telegram(request, &env, &cfg).await,
         path if path.starts_with("/llm/") => proxy::llm(request, &env, &ctx, &cfg).await,
-        path if path == "/mcp" || path.starts_with("/mcp/") => {
+        // Both are answered inside the MCP container: MCP calls by the MCP server, and
+        // requests for the files it saved by the file server next to it.
+        path if under(path, "/mcp") || under(path, "/file") => {
             proxy::mcp(request, &env, &cfg).await
         }
         _ => Response::error("not found", 404),
     }
+}
+
+/// Whether `path` is `prefix` itself or something below it.
+fn under(path: &str, prefix: &str) -> bool {
+    path.strip_prefix(prefix)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
 async fn telegram(mut request: Request, env: &Env, cfg: &Config) -> Result<Response> {

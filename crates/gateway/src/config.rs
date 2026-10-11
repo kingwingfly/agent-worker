@@ -69,6 +69,9 @@ pub struct Config {
     /// Development only: a runner started by hand that every session uses in place of
     /// its container, e.g. `http://127.0.0.1:8080`. See the README.
     pub dev_runner_url: Option<String>,
+    /// Development only: an MCP container's port served by processes started by hand,
+    /// e.g. `http://127.0.0.1:8090`, used in place of the shared MCP container.
+    pub dev_mcp_url: Option<String>,
 }
 
 fn var(env: &Env, name: &str) -> Option<String> {
@@ -139,6 +142,7 @@ impl Config {
             mcp_idle_ttl_ms: seconds(env, "MCP_IDLE_TTL_SECS", 900)?,
             dev_runner_url: var(env, "DEV_RUNNER_URL")
                 .map(|url| url.trim_end_matches('/').to_owned()),
+            dev_mcp_url: var(env, "DEV_MCP_URL").map(|url| url.trim_end_matches('/').to_owned()),
         })
     }
 }
