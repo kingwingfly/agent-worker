@@ -183,7 +183,7 @@ A prompt shows the first 1,500 characters of what is asked for: the command, or 
 
 The agent never writes a typesetting language. It writes Markdown and runs `md2pdf report.md`, which renders `/work/out/report.pdf` with pandoc and Typst, so the result does not depend on how capable the model is. Because it runs without asking, its arguments can do nothing else: the PDF goes to `/work/out` whatever directory the output name is given with, and a Markdown file whose name begins with a dash is refused, since pandoc would read the name as an option. Everything about the look is in `containers/agent/md2pdf/`:
 
-- `header.typ`: fonts and styling. Put the Noto CJK variant for your users first in the fallback list (`SC`, `TC`, `JP` or `KR`).
+- `header.typ`: fonts and styling. Put the Noto CJK variant for your users first in the fallback list (`SC`, `TC`, `JP` or `KR`). It also lets a table that is taller than a third of the page run on over the following pages, with its header row repeated, and scales a picture down to the width of the text and a third of the page's height; smaller pictures keep their size.
 - `defaults.yaml`: paper size, margins, font size, link colour.
 - `tidy.lua`: repairs for Markdown as models tend to write it. `<br>` becomes a line break, real HTML tags are removed, other text in angle brackets such as `<customer name>` is printed, and rows of `| a | b |` written without a header become a table instead of text full of pipes.
 

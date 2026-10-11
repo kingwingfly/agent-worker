@@ -57,10 +57,12 @@ COPY --chown=agent:agent skills/ /home/agent/.claude/skills/
 RUN chown -R agent:agent /home/agent/.claude
 
 USER agent
-# Fail the build, not a user's request, if the PDF toolchain does not fit together.
-RUN printf '# Check\n\n| a | b |\n|---|---|\n| 中文 | ok |\n' > /tmp/check.md \
+# Fail the build, not a user's request, if the PDF toolchain does not fit together. The
+# picture is there because header.typ measures every picture to decide its size.
+RUN printf '<svg xmlns="http://www.w3.org/2000/svg" width="900" height="1600"/>' > /tmp/check.svg \
+ && printf '# Check\n\n| a | b |\n|---|---|\n| 中文 | ok |\n\n![check](check.svg)\n' > /tmp/check.md \
  && md2pdf /tmp/check.md check.pdf \
- && rm /tmp/check.md /work/out/check.pdf
+ && rm /tmp/check.md /tmp/check.svg /work/out/check.pdf
 # md2pdf runs without the user being asked, so it has to refuse a file whose name pandoc
 # would take for an option, before it starts pandoc.
 RUN touch /tmp/-check.md; md2pdf /tmp/-check.md 2>/dev/null; [ "$?" -eq 1 ] && rm /tmp/-check.md

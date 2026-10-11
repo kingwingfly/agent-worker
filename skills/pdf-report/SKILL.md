@@ -31,8 +31,9 @@ You write Markdown. A tool turns it into the PDF.
    - Every table needs its header row and the `|---|` line under it. Put totals in the same table as the rows they add up.
    - Any language works, including Chinese, Japanese and Korean.
    - For a line break inside a table cell, write `<br>`.
-   - To include an image, save it next to the Markdown file and write `![caption](image.png)`.
-   - Do not write HTML, LaTeX or page-layout commands. Page size, fonts and page numbers are set for you.
+   - To include an image, save it next to the Markdown file and write `![caption](image.png)`. A large image is made smaller to fit the page.
+   - A table can have any number of rows. A long one continues on the next page by itself.
+   - Do not write HTML, LaTeX or page-layout commands. Page size, fonts, page numbers and page breaks are set for you.
 
 2. Convert it. Run this command on its own, not joined to other commands:
 
