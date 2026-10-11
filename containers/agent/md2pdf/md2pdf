@@ -8,7 +8,9 @@
 # directory, only the name is used. Images are looked up relative to the Markdown file.
 # Page setup and fonts live next to this script's defaults file, so the agent only ever
 # has to write Markdown. On success it prints the path and the page count, which leaves
-# the agent nothing to go and check.
+# the agent nothing to go and check, and that the user is about to receive the PDF: an
+# agent not told so moves the Markdown file and its pictures into the output directory
+# to have them delivered, and everything in there is sent.
 #
 # The agent runs this without asking the user, so its arguments must not be able to make
 # it do anything but that: read one Markdown file and write one PDF where PDFs go.
@@ -53,7 +55,8 @@ pandoc --defaults="$home/defaults.yaml" --output="$output" "./$name"
 
 pages=$(pdfinfo "$output" 2>/dev/null | awk '/^Pages:/ { print $2 }')
 case $pages in
-  "") echo "wrote $output" ;;
-  1) echo "wrote $output (1 page)" ;;
-  *) echo "wrote $output ($pages pages)" ;;
+  "") count="" ;;
+  1) count=" (1 page)" ;;
+  *) count=" ($pages pages)" ;;
 esac
+echo "wrote $output$count; the user receives it when you finish, so there is nothing to move or copy"
