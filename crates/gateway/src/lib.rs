@@ -4,12 +4,14 @@
 //! - `/llm/*`, `/mcp` and `/file` are what agent containers call; see [`proxy`].
 //!
 //! Everything is built for the host as well as for wasm32, so editors and `cargo test`
-//! see the whole crate. Only `metering`, `remember`, `render` and `update` can actually
-//! run there: the rest calls into the Workers runtime, which exists only in a Worker.
+//! see the whole crate. Only `metering`, `remember`, `render`, `scrub` and `update` can
+//! actually run there: the rest calls into the Workers runtime, which exists only in a
+//! Worker.
 
 pub mod metering;
 pub mod remember;
 pub mod render;
+pub mod scrub;
 pub mod update;
 
 mod bot;

@@ -1,16 +1,17 @@
 //! The routes agent containers call: `/llm/*` to the LLM gateway, and `/mcp` and `/file`
 //! to the shared MCP container. All accept only a valid session token and replace it with
 //! the real upstream credential or identity, so no upstream secret ever enters a container.
+//! Nor does anything that says which gateway it is: see [`scrub`].
 
 use agent_proto::{
     Usage,
     token::{self, Claims},
 };
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt, stream};
 use serde_json::json;
 use wasm_bindgen::JsValue;
 use worker::{
-    Context, Env, Fetch, Headers, Method, Request, RequestInit, Response, Result, Stub,
+    ByteStream, Context, Env, Fetch, Headers, Method, Request, RequestInit, Response, Result, Stub,
     console_error, js_sys::Uint8Array,
 };
 
@@ -19,6 +20,7 @@ use crate::{
     mcp_host::{MCP_BINDING, MCP_INSTANCE},
     metering::{SseUsage, json_usage},
     platform::now_ms,
+    scrub::{self, SseScrub},
     session::{SESSION_BINDING, USAGE_PATH},
 };
 
@@ -83,12 +85,96 @@ async fn retarget(mut request: Request, target: &str, headers: Headers) -> Resul
     Request::new_with_init(target, &init)
 }
 
+/// How much of what the gateway said goes into one line of the log.
+const LOGGED_CHARS: usize = 2000;
+
+fn excerpt(said: &[u8]) -> String {
+    String::from_utf8_lossy(said)
+        .chars()
+        .take(LOGGED_CHARS)
+        .collect()
+}
+
+/// The headers of the gateway's response that are passed on.
+fn kept_headers(response: &Response) -> Result<Headers> {
+    let headers = Headers::new();
+    for name in scrub::KEPT_HEADERS {
+        if let Some(value) = response.headers().get(name)? {
+            headers.set(name, &value)?;
+        }
+    }
+    Ok(headers)
+}
+
+/// The answer to a model call that failed, in place of the gateway's own: what kind of
+/// failure it was, and nothing about where it happened.
+fn failure(status: u16, said: &[u8], headers: Headers) -> Result<Response> {
+    headers.set("content-type", "application/json")?;
+    let body = scrub::error_body(Some(status), said);
+    Ok(Response::from_json(&body)?
+        .with_status(status)
+        .with_headers(headers))
+}
+
+/// An event stream on its way to the container, with the errors in it replaced. What
+/// they said is logged for `session`.
+fn scrubbed(body: ByteStream, session: String) -> impl Stream<Item = Result<Vec<u8>>> {
+    stream::unfold(Some((body, SseScrub::default())), move |state| {
+        let session = session.clone();
+        async move {
+            let (mut body, mut scrub) = state?;
+            loop {
+                let next = body.next().await;
+                let ended = next.is_none();
+                let out = match next {
+                    Some(Ok(chunk)) => scrub.feed(&chunk),
+                    Some(Err(error)) => return Some((Err(error), None)),
+                    None => scrub.finish(),
+                };
+                for said in scrub.replaced.drain(..) {
+                    let said = excerpt(said.as_bytes());
+                    console_error!("{session}: the gateway failed inside its answer: {said}");
+                }
+                // Nothing to send yet means a line that has not arrived in full.
+                match (out.is_empty(), ended) {
+                    (false, false) => return Some((Ok(out), Some((body, scrub)))),
+                    (false, true) => return Some((Ok(out), None)),
+                    (true, true) => return None,
+                    (true, false) => {}
+                }
+            }
+        }
+    })
+}
+
 /// `ANY /llm/<path>` → `<LLM_BASE_URL>/<path>`. The response, usually an event stream, is
 /// passed back as it arrives, and a copy of it is read for the tokens it reports.
+///
+/// An error is not passed back as it arrives, whichever way the gateway reports it: with
+/// a status, inside the stream, or as a success that is none. The container gets one of
+/// our own making and the log gets the gateway's.
 pub async fn llm(request: Request, env: &Env, ctx: &Context, cfg: &Config) -> Result<Response> {
     let Some(claims) = authenticate(&request, cfg)? else {
         return unauthorized();
     };
+    let session = &claims.session;
+    forward(request, env, ctx, cfg, session)
+        .await
+        .or_else(|error| {
+            // Not returned as it is: the runtime's own errors can quote the address that
+            // was being called.
+            console_error!("{session}: a model call failed in the Worker: {error}");
+            failure(502, b"", Headers::new())
+        })
+}
+
+async fn forward(
+    request: Request,
+    env: &Env,
+    ctx: &Context,
+    cfg: &Config,
+    session: &str,
+) -> Result<Response> {
     let url = request.url()?;
     let path = url.path().strip_prefix("/llm").unwrap_or_default();
     let query = url
@@ -105,25 +191,49 @@ pub async fn llm(request: Request, env: &Env, ctx: &Context, cfg: &Config) -> Re
     let mut response = Fetch::Request(retarget(request, &target, headers).await?)
         .send()
         .await?;
+    let status = response.status_code();
+    let headers = kept_headers(&response)?;
+    if !(200..300).contains(&status) {
+        let said = response.bytes().await.unwrap_or_default();
+        let logged = excerpt(&said);
+        console_error!("{session}: the gateway answered {status}: {logged}");
+        return failure(status, &said, headers);
+    }
 
     // Metering must never cost the agent its answer: anything that goes wrong with the
     // copy is logged and the original is returned regardless.
-    if (200..300).contains(&response.status_code()) {
-        let session = env
-            .durable_object(SESSION_BINDING)
-            .and_then(|namespace| namespace.get_by_name(&claims.session));
-        match (response.cloned(), session) {
-            (Ok(copy), Ok(session)) => ctx.wait_until(async move {
-                if let Err(error) = meter(copy, session).await {
-                    console_error!("metering a model call failed: {error}");
-                }
-            }),
-            (Err(error), _) | (_, Err(error)) => {
-                console_error!("a model call could not be metered: {error}");
+    let stub = env
+        .durable_object(SESSION_BINDING)
+        .and_then(|namespace| namespace.get_by_name(session));
+    match (response.cloned(), stub) {
+        (Ok(copy), Ok(stub)) => ctx.wait_until(async move {
+            if let Err(error) = meter(copy, stub).await {
+                console_error!("metering a model call failed: {error}");
             }
+        }),
+        (Err(error), _) | (_, Err(error)) => {
+            console_error!("a model call could not be metered: {error}");
         }
     }
-    Ok(response)
+
+    let streamed = headers
+        .get("content-type")?
+        .is_some_and(|kind| kind.starts_with("text/event-stream"));
+    if streamed {
+        let body = scrubbed(response.stream()?, session.to_owned());
+        return Ok(Response::from_stream(body)?
+            .with_status(status)
+            .with_headers(headers));
+    }
+    let body = response.bytes().await?;
+    if !scrub::is_answer(&body) {
+        let logged = excerpt(&body);
+        console_error!("{session}: the gateway answered {status} with no answer: {logged}");
+        return failure(502, &body, headers);
+    }
+    Ok(Response::from_bytes(body)?
+        .with_status(status)
+        .with_headers(headers))
 }
 
 /// Reads a copy of a model response to its end and reports the tokens to the session.
