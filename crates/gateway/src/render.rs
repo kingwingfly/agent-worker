@@ -7,7 +7,10 @@
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use serde_json::{Value, json};
 
-use crate::remember::{self, Scope};
+use crate::{
+    remember::{self, Scope},
+    store::{Checkpoint, Conversation},
+};
 
 /// Telegram's limit is 4096 UTF-16 code units of text after entity parsing. Measuring the
 /// HTML source instead, with some slack, is always on the safe side.
@@ -15,6 +18,10 @@ const MESSAGE_BUDGET: usize = 3900;
 const STATUS_TEXT_TAIL: usize = 1200;
 const STATUS_TOOL_LINES: usize = 6;
 const PROMPT_INPUT_LIMIT: usize = 1500;
+/// How much of a message a button of the `/resume` or `/rewind` list shows.
+const PICK_LABEL_CHARS: usize = 36;
+/// How much of a message is quoted back once it has been picked.
+const PICKED_TEXT_LIMIT: usize = 1500;
 
 /// Headings of the progress message: while a turn runs, and for each way it can end.
 pub const WORKING: &str = "⏳ Working…";
@@ -566,9 +573,264 @@ pub fn answered_questions(input: &Value, answers: &serde_json::Map<String, Value
     json!({ "questions": input["questions"], "answers": answers })
 }
 
+/// A pressed button of the `/resume` or `/rewind` list. Like [`Callback`], it has to fit
+/// in 64 bytes: a conversation's id is a UUID and a checkpoint is named by a time in
+/// milliseconds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Pick {
+    /// Go on with this conversation.
+    Resume { conversation: String },
+    /// Take the conversation back to before the turn this checkpoint was saved after.
+    Rewind {
+        conversation: String,
+        checkpoint: u64,
+    },
+}
+
+impl Pick {
+    pub fn encode(&self) -> String {
+        match self {
+            Self::Resume { conversation } => format!("s:{conversation}"),
+            Self::Rewind {
+                conversation,
+                checkpoint,
+            } => format!("r:{conversation}:{checkpoint}"),
+        }
+    }
+
+    pub fn parse(data: &str) -> Option<Self> {
+        let mut parts = data.split(':');
+        let (kind, conversation) = (parts.next()?, parts.next()?.to_owned());
+        let pick = match kind {
+            "s" => Self::Resume { conversation },
+            "r" => Self::Rewind {
+                conversation,
+                checkpoint: parts.next()?.parse().ok()?,
+            },
+            _ => return None,
+        };
+        parts.next().is_none().then_some(pick)
+    }
+}
+
+/// How long ago something was, as briefly as a button needs it.
+fn ago(now_ms: u64, then_ms: u64) -> String {
+    match now_ms.saturating_sub(then_ms) / 60_000 {
+        0 => "just now".into(),
+        minutes @ 1..60 => format!("{minutes} min ago"),
+        minutes @ 60..1440 => format!("{} h ago", minutes / 60),
+        minutes => format!("{} d ago", minutes / 1440),
+    }
+}
+
+/// One row of a list: the start of a message, on one line, and its age.
+fn pick_row(text: &str, then_ms: u64, now_ms: u64, pick: Pick) -> Value {
+    let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let label = format!(
+        "{} · {}",
+        truncate(&one_line, PICK_LABEL_CHARS),
+        ago(now_ms, then_ms)
+    );
+    json!([{ "text": label, "callback_data": pick.encode() }])
+}
+
+/// The `/resume` list: every saved conversation but the one the chat is in, the one
+/// used last first. `None` if there is no other.
+pub fn resume_picker(
+    conversations: &[Conversation],
+    current: &str,
+    now_ms: u64,
+) -> Option<(String, Value)> {
+    let rows: Vec<Value> = conversations
+        .iter()
+        .filter(|conversation| conversation.id != current)
+        .map(|conversation| {
+            let pick = Pick::Resume {
+                conversation: conversation.id.clone(),
+            };
+            pick_row(&conversation.title, conversation.used_ms, now_ms, pick)
+        })
+        .collect();
+    let html = "💬 <b>Earlier conversations</b>\n\
+                Pick one to go on with it. The one you are in now is kept.";
+    (!rows.is_empty()).then(|| (html.to_owned(), json!({ "inline_keyboard": rows })))
+}
+
+/// What the `/resume` list turns into once a conversation has been picked. `last` is
+/// the newest message in it.
+pub fn resumed(conversation: &Conversation, last: Option<&str>) -> String {
+    let mut html = format!(
+        "💬 <b>Resumed</b>\n<i>{}</i>",
+        escape(&truncate(&conversation.title, PICKED_TEXT_LIMIT))
+    );
+    if let Some(last) = last.filter(|last| *last != conversation.title) {
+        html.push_str(&format!(
+            "\n\nYour last message in it:\n<pre>{}</pre>",
+            escape(&truncate(last, PICKED_TEXT_LIMIT))
+        ));
+    }
+    html
+}
+
+/// The checkpoints whose turn can be undone, newest first like `checkpoints`. Undoing a
+/// turn means going back to what it started from, so that has to be kept still, or to
+/// have been nothing.
+pub fn rewindable(checkpoints: &[Checkpoint]) -> Vec<&Checkpoint> {
+    checkpoints
+        .iter()
+        .filter(|checkpoint| match checkpoint.parent {
+            Some(0) => true,
+            Some(parent) => checkpoints.iter().any(|other| other.at_ms == parent),
+            None => false,
+        })
+        .collect()
+}
+
+/// The `/rewind` list: the user's recent messages in `conversation`, newest first.
+/// `None` if no turn can be undone.
+pub fn rewind_picker(
+    conversation: &str,
+    checkpoints: &[Checkpoint],
+    now_ms: u64,
+) -> Option<(String, Value)> {
+    let rows: Vec<Value> = rewindable(checkpoints)
+        .into_iter()
+        .map(|checkpoint| {
+            let pick = Pick::Rewind {
+                conversation: conversation.to_owned(),
+                checkpoint: checkpoint.at_ms,
+            };
+            pick_row(&checkpoint.text, checkpoint.at_ms, now_ms, pick)
+        })
+        .collect();
+    let html = "⏪ <b>Rewind</b>\n\
+                Pick a message. The conversation and the files go back to how they were \
+                before you sent it, and what came after is forgotten.";
+    (!rows.is_empty()).then(|| (html.to_owned(), json!({ "inline_keyboard": rows })))
+}
+
+/// What the `/rewind` list turns into once a message has been picked. The message is
+/// quoted so that it can be copied and sent again.
+pub fn rewound(text: &str) -> String {
+    format!(
+        "⏪ <b>Rewound</b>\nThe conversation and the files are as they were before this \
+         message:\n<pre>{}</pre>\nSend it again, or something else.",
+        escape(&truncate(text, PICKED_TEXT_LIMIT))
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn checkpoint(at_ms: u64, parent: Option<u64>, text: &str) -> Checkpoint {
+        Checkpoint {
+            at_ms,
+            parent,
+            text: text.into(),
+        }
+    }
+
+    #[test]
+    fn a_pick_survives_callback_data_and_fits_telegrams_limit() {
+        let conversation = "0b0e7f0a-52a5-4b56-9f6f-6f1e8f0c2a11".to_owned();
+        for pick in [
+            Pick::Resume {
+                conversation: conversation.clone(),
+            },
+            Pick::Rewind {
+                conversation,
+                checkpoint: 9_999_999_999_999,
+            },
+        ] {
+            let data = pick.encode();
+            assert!(data.len() <= 64, "{data}");
+            assert_eq!(Pick::parse(&data), Some(pick));
+            // The two kinds of button never read each other's data.
+            assert_eq!(Callback::parse(&data), None);
+        }
+        assert_eq!(Pick::parse("p:0b0e7f0a:a"), None);
+        assert_eq!(Pick::parse("r:0b0e7f0a"), None);
+        assert_eq!(Pick::parse("r:0b0e7f0a:12:extra"), None);
+    }
+
+    #[test]
+    fn a_turn_can_be_rewound_only_while_what_it_started_from_is_kept() {
+        // Newest first. The oldest kept one started from a checkpoint that is gone, and
+        // the one before a state saved without a checkpoint has nothing to go back to.
+        let kept = [
+            checkpoint(400, Some(300), "fourth"),
+            checkpoint(300, Some(200), "third"),
+            checkpoint(200, Some(100), "second"),
+        ];
+        let offered: Vec<_> = rewindable(&kept).iter().map(|kept| kept.at_ms).collect();
+        assert_eq!(offered, [400, 300]);
+
+        // A conversation's first turn started from nothing, which is always there.
+        let short = [
+            checkpoint(200, Some(100), "second"),
+            checkpoint(100, Some(0), "first"),
+        ];
+        assert_eq!(rewindable(&short).len(), 2);
+        assert!(rewindable(&[checkpoint(100, None, "after an old state")]).is_empty());
+        assert_eq!(rewind_picker("c", &kept[2..], 500), None);
+    }
+
+    #[test]
+    fn the_rewind_list_shows_each_message_on_one_line_with_its_age() {
+        let kept = [
+            checkpoint(
+                7_200_000,
+                Some(60_000),
+                "Now make\nit a PDF, with a long title that goes on",
+            ),
+            checkpoint(60_000, Some(0), "Summarise the chat"),
+        ];
+        let (html, keyboard) = rewind_picker("c1", &kept, 7_260_000).expect("a list");
+        assert!(html.starts_with("⏪ <b>Rewind</b>"));
+        assert_eq!(
+            keyboard,
+            json!({ "inline_keyboard": [
+                [{ "text": "Now make it a PDF, with a long title… · 1 min ago", "callback_data": "r:c1:7200000" }],
+                [{ "text": "Summarise the chat · 2 h ago", "callback_data": "r:c1:60000" }],
+            ] })
+        );
+        assert_eq!(ago(90_000_000, 0), "1 d ago");
+        assert_eq!(ago(10, 20), "just now");
+    }
+
+    #[test]
+    fn the_resume_list_leaves_out_the_conversation_the_chat_is_in() {
+        let conversation = |id: &str, title: &str, used_ms| Conversation {
+            id: id.into(),
+            title: title.into(),
+            used_ms,
+            head: used_ms,
+        };
+        let saved = [
+            conversation("now", "The current one", 300_000),
+            conversation("old", "Plan the outing", 0),
+        ];
+        let (_, keyboard) = resume_picker(&saved, "now", 300_000).expect("a list");
+        assert_eq!(
+            keyboard,
+            json!({ "inline_keyboard": [
+                [{ "text": "Plan the outing · 5 min ago", "callback_data": "s:old" }],
+            ] })
+        );
+        assert_eq!(resume_picker(&saved[..1], "now", 300_000), None);
+
+        assert_eq!(
+            resumed(&saved[1], Some("And <b>who</b> pays?")),
+            "💬 <b>Resumed</b>\n<i>Plan the outing</i>\n\n\
+             Your last message in it:\n<pre>And &lt;b&gt;who&lt;/b&gt; pays?</pre>"
+        );
+        // A conversation of one message is not shown that message twice.
+        assert_eq!(
+            resumed(&saved[1], Some("Plan the outing")),
+            "💬 <b>Resumed</b>\n<i>Plan the outing</i>"
+        );
+    }
 
     #[test]
     fn markdown_becomes_telegram_html() {

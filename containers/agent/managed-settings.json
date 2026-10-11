@@ -4,7 +4,8 @@
       "Skill",
       "mcp__domain",
       "Bash(md2pdf *)",
-      "Bash(mcp-file *)"
+      "Bash(mcp-file *)",
+      "Read(//**)"
     ],
     "disableBypassPermissionsMode": "disable"
   },
