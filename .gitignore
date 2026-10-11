@@ -32,3 +32,5 @@ rustc-ice-*.txt
 node_modules
 
 .worktrees/
+
+CLAUDE.md
