@@ -140,7 +140,7 @@ Files over 20 MB are refused (`MCP_FILE_MAX_BYTES` in the agent image's environm
 
 ### What the agent may do
 
-`containers/agent/managed-settings.json` is the permission policy and `crates/runner/src/config.rs` (`DEFAULT_TOOLS`) the list of built-in tools. As shipped: files under `/work` can be read and edited freely, the `domain` MCP server, `md2pdf` and `mcp-file` are pre-approved, read-only shell commands run without asking, and every other shell command needs a button press. Web access, subagents, background tasks and scheduling are off.
+`containers/agent/managed-settings.json` is the permission policy and `crates/runner/src/config.rs` (`DEFAULT_TOOLS`) the list of built-in tools. As shipped: files under `/work` can be edited freely, and the `domain` MCP server, `md2pdf` and `mcp-file` are pre-approved. Reading needs no approval anywhere in the container (`Read(//**)`), with the Read tool or a read-only shell command such as `ls`, `head` or `wc`; without that rule Claude Code asks about every read outside `/work`, which includes the files a skill brings with it. Every other shell command needs a button press, `python3` included. Web access, subagents, background tasks and scheduling are off, and so are the skills that ship with Claude Code (`containers/agent/settings.json`): the agent sees only the ones in `skills/`.
 
 A prompt can be answered with **Always**. For a shell command that covers the identical command only; for any other tool it covers every later use of that tool, and the button says which. The session keeps these answers, so they last until `/new` even though the container is replaced after every idle period.
 
