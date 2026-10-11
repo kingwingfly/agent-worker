@@ -16,7 +16,11 @@ const STATUS_TEXT_TAIL: usize = 1200;
 const STATUS_TOOL_LINES: usize = 6;
 const PROMPT_INPUT_LIMIT: usize = 1500;
 
+/// Headings of the progress message: while a turn runs, and for each way it can end.
 pub const WORKING: &str = "⏳ Working…";
+pub const DONE: &str = "✅ Done";
+pub const STOPPED: &str = "⏹ Stopped";
+pub const FAILED: &str = "⚠️ Stopped early";
 
 pub fn escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
@@ -319,11 +323,18 @@ fn tool_summary(name: &str, input: &Value) -> String {
     }
 }
 
-/// What the user sees while a turn runs, built up from Claude's stream.
+/// A turn's progress, built up from Claude's stream: the tools it used and what it said
+/// along the way. It is shown while the turn runs and stays in the chat afterwards.
 #[derive(Debug, Default)]
 pub struct Status {
     tools: Vec<String>,
-    text: String,
+    /// Tool calls that no longer fit in `tools`.
+    earlier: usize,
+    /// What Claude last said before using a tool.
+    said: String,
+    /// What Claude said last. Unless a tool call follows, this is the answer, which is
+    /// sent as a message of its own and so is not shown here.
+    latest: String,
 }
 
 impl Status {
@@ -337,15 +348,18 @@ impl Status {
             match block["type"].as_str() {
                 Some("text") => {
                     if let Some(text) = block["text"].as_str().filter(|text| !text.is_empty()) {
-                        self.text = text.to_owned();
-                        changed = true;
+                        self.latest = text.to_owned();
                     }
                 }
                 Some("tool_use") => {
+                    if !self.latest.is_empty() {
+                        self.said = std::mem::take(&mut self.latest);
+                    }
                     let name = block["name"].as_str().unwrap_or("tool");
                     self.tools.push(tool_summary(name, &block["input"]));
                     if self.tools.len() > STATUS_TOOL_LINES {
                         self.tools.remove(0);
+                        self.earlier += 1;
                     }
                     changed = true;
                 }
@@ -355,14 +369,22 @@ impl Status {
         changed
     }
 
-    pub fn render(&self) -> String {
-        let mut html = String::from(WORKING);
+    /// Whether there is nothing to show but the heading.
+    pub fn is_empty(&self) -> bool {
+        self.tools.is_empty() && self.said.is_empty()
+    }
+
+    pub fn render(&self, heading: &str) -> String {
+        let mut html = String::from(heading);
+        if self.earlier > 0 {
+            html.push_str(&format!("\n<i>… {} earlier</i>", self.earlier));
+        }
         for tool in &self.tools {
             html.push_str(&format!("\n🔧 <code>{}</code>", escape(tool)));
         }
-        if !self.text.is_empty() {
-            let skip = self.text.chars().count().saturating_sub(STATUS_TEXT_TAIL);
-            let tail: String = self.text.chars().skip(skip).collect();
+        if !self.said.is_empty() {
+            let skip = self.said.chars().count().saturating_sub(STATUS_TEXT_TAIL);
+            let tail: String = self.said.chars().skip(skip).collect();
             html.push_str("\n\n");
             if skip > 0 {
                 html.push('…');
@@ -625,10 +647,11 @@ mod tests {
     }
 
     #[test]
-    fn status_shows_recent_tools_and_the_latest_text() {
+    fn status_shows_recent_tools_and_what_was_said_before_them() {
         let mut status = Status::default();
         assert!(!status.observe(&json!({ "type": "system" })));
-        assert_eq!(status.render(), WORKING);
+        assert!(status.is_empty());
+        assert_eq!(status.render(WORKING), WORKING);
 
         let event = json!({ "type": "assistant", "message": { "content": [
             { "type": "text", "text": "Let me check <that>." },
@@ -636,11 +659,56 @@ mod tests {
             { "type": "tool_use", "name": "mcp__domain__lookup", "input": { "id": 7 } },
         ] } });
         assert!(status.observe(&event));
+        assert!(!status.is_empty());
         assert_eq!(
-            status.render(),
+            status.render(WORKING),
             "⏳ Working…\n🔧 <code>Bash: ls -la</code>\n🔧 <code>domain › lookup</code>\n\n\
              Let me check &lt;that&gt;."
         );
+    }
+
+    fn said(text: &str) -> Value {
+        json!({ "type": "assistant", "message": { "content": [
+            { "type": "text", "text": text },
+        ] } })
+    }
+
+    fn used(tool: &str) -> Value {
+        json!({ "type": "assistant", "message": { "content": [
+            { "type": "tool_use", "name": tool, "input": {} },
+        ] } })
+    }
+
+    #[test]
+    fn status_leaves_the_answer_out() {
+        let mut status = Status::default();
+        // Words become part of the progress only once a tool call follows them.
+        assert!(!status.observe(&said("I'll read the file first.")));
+        assert!(status.is_empty());
+        assert!(status.observe(&used("Read")));
+        // The last words of a turn are the answer.
+        assert!(!status.observe(&said("The file has three lines.")));
+        assert_eq!(
+            status.render(DONE),
+            "✅ Done\n🔧 <code>Read</code>\n\nI'll read the file first."
+        );
+
+        // A turn that only answers has no progress to keep.
+        let mut status = Status::default();
+        assert!(!status.observe(&said("Hello!")));
+        assert!(status.is_empty());
+    }
+
+    #[test]
+    fn status_counts_the_tools_it_no_longer_lists() {
+        let mut status = Status::default();
+        for index in 0..STATUS_TOOL_LINES + 2 {
+            status.observe(&used(&format!("tool{index}")));
+        }
+        let html = status.render(WORKING);
+        assert!(html.starts_with("⏳ Working…\n<i>… 2 earlier</i>\n🔧 <code>tool2</code>\n"));
+        assert!(html.ends_with(&format!("<code>tool{}</code>", STATUS_TOOL_LINES + 1)));
+        assert_eq!(html.matches("🔧").count(), STATUS_TOOL_LINES);
     }
 
     #[test]

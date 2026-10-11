@@ -101,7 +101,8 @@ struct Turn {
     id: String,
     text: String,
     started_at_ms: u64,
-    /// The "Working…" message that is edited as the turn progresses.
+    /// The message that shows the turn's progress. It is edited as the turn goes on and
+    /// stays in the chat when it is over.
     status_message_id: Option<i64>,
     /// The message has been handed to the runner, so stopping means interrupting it.
     #[serde(default)]
@@ -466,9 +467,7 @@ impl Inner {
             // interrupt: the turn simply ends here. A `drive` on its way to the runner
             // reads the turn again before sending and finds it gone.
             self.close_turn(cfg.idle_ttl_ms).await;
-            if let Some(message_id) = turn.status_message_id {
-                let _ = bot.delete_message(self.chat_id(), message_id).await;
-            }
+            self.close_status(bot, &turn, render::STOPPED).await;
             return "⏹ Stopped.".into();
         }
         self.update(|session| {
@@ -864,7 +863,7 @@ impl Inner {
         }
     }
 
-    /// Updates the status message, at most once per interval.
+    /// Updates the progress message, at most once per interval.
     async fn show_status(&self) {
         let Some(message_id) = self.turn().and_then(|turn| turn.status_message_id) else {
             return;
@@ -876,7 +875,7 @@ impl Inner {
                 return;
             }
             live.last_status_edit_ms = now;
-            live.status.render()
+            live.status.render(render::WORKING)
         };
         if let Ok(cfg) = self.cfg() {
             let bot = Bot::new(&cfg);
@@ -884,6 +883,23 @@ impl Inner {
                 .edit_message(self.chat_id(), message_id, &html, None)
                 .await;
         }
+    }
+
+    /// Gives the progress message its last form when a turn is over. It stays in the chat
+    /// as the record of what was done; one that never got past "Working…" is removed.
+    async fn close_status(&self, bot: &Bot, turn: &Turn, heading: &str) {
+        let Some(message_id) = turn.status_message_id else {
+            return;
+        };
+        let html = {
+            let live = self.live.borrow();
+            (!live.status.is_empty()).then(|| live.status.render(heading))
+        };
+        let chat_id = self.chat_id();
+        let _ = match html {
+            Some(html) => bot.edit_message(chat_id, message_id, &html, None).await,
+            None => bot.delete_message(chat_id, message_id).await,
+        };
     }
 
     // ----- Permission prompts and clarifying questions -----
@@ -1126,20 +1142,15 @@ impl Inner {
     /// happened to the others, and what could not be done is said at the end.
     async fn report_turn(&self, cfg: &Config, turn: &Turn, result: &TurnResult) {
         let bot = Bot::new(cfg);
-        let chat_id = self.chat_id();
-        if let Some(message_id) = turn.status_message_id {
-            let _ = bot.delete_message(chat_id, message_id).await;
-        }
-
         let answer = result
             .text
             .as_deref()
             .filter(|text| !text.trim().is_empty());
-        let messages = match answer {
+        let (heading, messages) = match answer {
             // A turn that finished is answered even if a stop was on its way.
-            Some(text) if !result.is_error => render::answer(text),
-            _ if turn.stop_requested => vec!["⏹ Stopped.".to_owned()],
-            None if !result.is_error => vec!["(no answer)".to_owned()],
+            Some(text) if !result.is_error => (render::DONE, render::answer(text)),
+            _ if turn.stop_requested => (render::STOPPED, vec!["⏹ Stopped.".to_owned()]),
+            None if !result.is_error => (render::DONE, vec!["(no answer)".to_owned()]),
             detail => {
                 let mut message = format!(
                     "⚠️ The agent stopped early ({}).",
@@ -1148,9 +1159,10 @@ impl Inner {
                 if let Some(detail) = detail {
                     message.push_str(&format!("\n<pre>{}</pre>", render::escape(detail)));
                 }
-                vec![message]
+                (render::FAILED, vec![message])
             }
         };
+        self.close_status(&bot, turn, heading).await;
         let mut problems = Vec::new();
         for message in &messages {
             if let Err(error) = self.deliver(&bot, message).await {
@@ -1186,8 +1198,8 @@ impl Inner {
         let turn = self.update(|session| session.turn.take());
         if let Ok(cfg) = self.cfg() {
             let bot = Bot::new(&cfg);
-            if let Some(message_id) = turn.and_then(|turn| turn.status_message_id) {
-                let _ = bot.delete_message(self.chat_id(), message_id).await;
+            if let Some(turn) = &turn {
+                self.close_status(&bot, turn, render::FAILED).await;
             }
             self.close_approvals(&bot, false, "The turn was abandoned.")
                 .await;
