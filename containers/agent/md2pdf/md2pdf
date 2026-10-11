@@ -4,35 +4,52 @@
 #   md2pdf report.md             writes /work/out/report.pdf
 #   md2pdf report.md summary.pdf writes /work/out/summary.pdf
 #
-# An output name containing a directory is used as given. Images are looked up relative
-# to the Markdown file. Page setup and fonts live next to this script's defaults file,
-# so the agent only ever has to write Markdown. On success it prints the path and the
-# page count, which leaves the agent nothing to go and check.
+# The PDF always goes into the output directory: of an output name given with a
+# directory, only the name is used. Images are looked up relative to the Markdown file.
+# Page setup and fonts live next to this script's defaults file, so the agent only ever
+# has to write Markdown. On success it prints the path and the page count, which leaves
+# the agent nothing to go and check.
+#
+# The agent runs this without asking the user, so its arguments must not be able to make
+# it do anything but that: read one Markdown file and write one PDF where PDFs go.
 set -eu
 
 home="${MD2PDF_HOME:-/etc/agent/md2pdf}"
 out_dir="${MD2PDF_OUT_DIR:-/work/out}"
+
+fail() {
+  echo "md2pdf: $*" >&2
+  exit 1
+}
 
 if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
   echo "usage: md2pdf INPUT.md [OUTPUT.pdf]" >&2
   exit 2
 fi
 input=$1
-if [ ! -f "$input" ]; then
-  echo "md2pdf: no such file: $input" >&2
-  exit 1
-fi
+[ -f "$input" ] || fail "no such file: $input"
 
-output=${2:-$(basename "${input%.*}").pdf}
-case $output in
-  /*) ;;
-  */*) output="$PWD/$output" ;;
-  *) output="$out_dir/$output" ;;
+case $input in
+  */*) dir=${input%/*} name=${input##*/} ;;
+  *) dir=. name=$input ;;
 esac
-mkdir -p "$(dirname "$output")"
+[ -n "$dir" ] || dir=/
+# pandoc takes options wherever they stand on its command line, and some of them make it
+# run a program. A file name is never handed to it in a form it could read as one.
+case $name in
+  -*) fail "the name of the Markdown file must not begin with a dash: $name" ;;
+esac
 
-cd "$(dirname "$input")"
-pandoc --defaults="$home/defaults.yaml" "$(basename "$input")" --output="$output"
+output=${2:-${name%.*}.pdf}
+output=${output##*/}
+case $output in
+  "" | . | .. | -*) fail "not a name for the PDF: ${2:-}" ;;
+esac
+output="$out_dir/$output"
+mkdir -p "$out_dir"
+
+cd -- "$dir"
+pandoc --defaults="$home/defaults.yaml" --output="$output" "./$name"
 
 pages=$(pdfinfo "$output" 2>/dev/null | awk '/^Pages:/ { print $2 }')
 case $pages in

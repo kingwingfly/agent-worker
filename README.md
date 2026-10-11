@@ -120,7 +120,7 @@ With podman, put `WRANGLER_DOCKER_BIN="$PWD/containers/docker-via-podman"` in fr
    npx wrangler secret put TELEGRAM_BOT_TOKEN
    npx wrangler secret put TELEGRAM_WEBHOOK_SECRET   # any random string
    npx wrangler secret put LLM_API_KEY
-   npx wrangler secret put SESSION_TOKEN_SECRET      # any long random string
+   npx wrangler secret put SESSION_TOKEN_SECRET      # a random string of 16 characters or more
    ```
 3. `npx wrangler deploy`. The first deploy builds and pushes both images, which takes a few minutes.
 4. Register the webhook with the same secret:
@@ -134,6 +134,8 @@ With podman, put `WRANGLER_DOCKER_BIN="$PWD/containers/docker-via-podman"` in fr
 ### The LLM gateway
 
 It must expose the Anthropic Messages format: `POST /v1/messages` with unbuffered SSE, the `anthropic-version` and `anthropic-beta` headers forwarded, and `cache_control` left in place (otherwise every turn is billed uncached). Claude Code is only supported with Claude models. If the gateway rejects beta fields, add `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1` to the agent image's environment.
+
+The `/llm` proxy passes on `POST /v1/messages` and `POST /v1/messages/count_tokens` and nothing else, which is all Claude Code asks for; any other request is answered with a 404 of the Worker's own. With `MODEL` and `SMALL_MODEL` both set, a request for any other model is refused with a 403. Both refusals are logged with the chat they came from, which is where to look if a later version of Claude Code needs something more (`crates/gateway/src/calls.rs`).
 
 ### Your MCP server
 
@@ -175,9 +177,11 @@ Files over 20 MB are refused (`MCP_FILE_MAX_BYTES` in the agent image's environm
 
 A prompt can be answered with **Always**. For a shell command that covers the identical command only; for any other tool it covers every later use of that tool, and the button says which. The session keeps these answers, so they last until `/new` or `/resume` even though the container is replaced after every idle period.
 
+A prompt shows the first 1,500 characters of what is asked for: the command, or the tool's input with its shortest fields first, so that a path or an address comes before the content sent to it. A request longer than that is also sent whole, as `request.txt` just above the prompt, because the answer covers all of it. If that file cannot be sent, the request is declined without asking.
+
 ### PDFs
 
-The agent never writes a typesetting language. It writes Markdown and runs `md2pdf report.md`, which renders `/work/out/report.pdf` with pandoc and Typst, so the result does not depend on how capable the model is. Everything about the look is in `containers/agent/md2pdf/`:
+The agent never writes a typesetting language. It writes Markdown and runs `md2pdf report.md`, which renders `/work/out/report.pdf` with pandoc and Typst, so the result does not depend on how capable the model is. Because it runs without asking, its arguments can do nothing else: the PDF goes to `/work/out` whatever directory the output name is given with, and a Markdown file whose name begins with a dash is refused, since pandoc would read the name as an option. Everything about the look is in `containers/agent/md2pdf/`:
 
 - `header.typ`: fonts and styling. Put the Noto CJK variant for your users first in the fallback list (`SC`, `TC`, `JP` or `KR`).
 - `defaults.yaml`: paper size, margins, font size, link colour.
@@ -199,15 +203,18 @@ To try a change without building the image, install pandoc and Typst and run `MD
 | `IDLE_TTL_SECS` | 120 | How long a container stays warm after answering |
 | `APPROVAL_TIMEOUT_SECS` | 600 | Unanswered prompts are denied after this |
 | `TURN_TIMEOUT_SECS` | 1800 | A turn is interrupted after this |
-| `DAILY_TOKEN_BUDGET` | 0 (off) | Fresh tokens per chat per UTC day, counted at the `/llm` proxy from what each model call reports |
+| `DAILY_TOKEN_BUDGET` | 0 (off) | Fresh tokens per chat per UTC day, counted at the `/llm` proxy from what each model call reports. Checked when a message arrives and before every model call, so a turn that uses it up ends there |
 | `MCP_IDLE_TTL_SECS` | 900 | Idle time before the MCP container stops |
 
 ## Security model
 
-- A container holds one credential: a session token that expires after 24 hours and is only accepted by this Worker's `/llm` and `/mcp` routes. The gateway key and bot token never leave the Worker.
+- A container holds one credential: a session token that is only accepted by this Worker's `/llm`, `/mcp` and `/file` routes. The gateway key and bot token never leave the Worker.
+- The agent can read that token, so holding it is not enough. Before acting on one, the proxy asks the chat's session, which refuses a token that is not the one its running container was started with: a token stops working when its container is stopped or replaced, well before its 24 hours are up. For a model call the session also refuses once the day's budget is used up, and the proxy passes on only the two requests Claude Code makes, for the two configured models. What is left to someone who copies a token out is what the agent itself could do: model calls on the chat's budget and the chat's MCP calls, while the container runs.
 - The runner's control API needs a secret the session sets before any agent process exists, and the runner makes its own memory unreadable to the agent, so the agent cannot approve its own prompts.
 - The permission policy is a root-owned managed settings file. Settings the agent writes in its working directory are not loaded.
-- Containers currently have outbound internet access. An approved shell command can therefore send data anywhere; keep the pre-approved list short.
+- Containers currently have outbound internet access. An approved shell command can therefore send data anywhere; keep the pre-approved list short. A command on that list runs with whatever arguments the agent gives it, so it has to be safe with all of them, as `md2pdf` and `mcp-file` are meant to be. The `domain` MCP server is pre-approved as a whole: if its tools return text written by third parties, that text can steer the agent into calling them, and no prompt stands in between.
+- A permission prompt shows what is being approved, and all of it: a request too long for the message is attached as a file. The file of an output document is uploaded to Telegram under a boundary made up for that upload, so its content cannot add to the request.
+- `SESSION_TOKEN_SECRET` must be at least 16 characters and no secret may be empty; the Worker answers 500 to everything until that is so. A short signing key could be found by trying keys against a token, and an empty webhook secret is what a request without the header presents.
 - Nothing a failed model call says reaches a container or the chat. A gateway's error names its site and quotes the ids it knows the request by, and Claude Code prints such an error into its answer word for word. So the `/llm` proxy rebuilds every error from its status and its kind (`crates/gateway/src/scrub.rs`): an error status, an `error` event inside a stream, and a status 200 whose body is an error or a page of the gateway's. It also drops every response header but the five that say what the body is and when to retry. The gateway's own words go to the Worker's log, with the chat they belong to, which is where to look when a user reports "The model service had an internal error". The bot, for its part, never shows this Worker's host, which Claude Code adds to some of its messages.
 - What a successful model call returns is passed on as it is, ids and model name included. It is not shown in the chat, but it is in the transcript inside the container, which the agent can read.
 

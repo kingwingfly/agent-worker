@@ -26,6 +26,7 @@ use worker::{
 
 use crate::{
     bot::Bot,
+    calls::{self, Admission, Refusal, Standing},
     config::Config,
     container_ext,
     mcp_host::{MCP_BINDING, MCP_INSTANCE, WARM_PATH},
@@ -39,9 +40,11 @@ use crate::{
 pub const SESSION_BINDING: &str = "SESSION";
 /// Carries the Durable Object's name, which it cannot always read from its own id.
 pub const NAME_HEADER: &str = "x-session-name";
-/// Requests to the object: a Telegram update, or tokens spent as seen by the LLM proxy.
+/// Requests to the object: a Telegram update, tokens spent as seen by the LLM proxy, or
+/// a proxy asking whether a session token may still be acted on.
 pub const UPDATE_PATH: &str = "/update";
 pub const USAGE_PATH: &str = "/usage";
+pub const ADMIT_PATH: &str = "/admit";
 
 const STATE_BUCKET: &str = "STATE";
 const SESSION_KEY: &str = "session";
@@ -233,6 +236,13 @@ impl DurableObject for SessionDO {
             self.inner.store.add_usage(today(), report.tokens)?;
             return Response::empty();
         }
+        if request.path() == ADMIT_PATH {
+            let asked: Admission = request.json().await?;
+            return match self.inner.refusal(asked)? {
+                Some(refusal) => Response::error("refused", refusal.status()),
+                None => Response::empty(),
+            };
+        }
         let name = request.headers().get(NAME_HEADER)?.unwrap_or_default();
         let update: Update = request.json().await?;
         if let Err(error) = self.inner.on_update(&name, update).await {
@@ -280,6 +290,23 @@ impl Inner {
             .container()
             .map(Host::Container)
             .ok_or_else(|| error("SessionDO has no container"))
+    }
+
+    /// Why a request that came with a valid session token is turned away, if it is: the
+    /// token belongs to a container that is no longer this chat's, or it is a model call
+    /// and today's tokens are used up.
+    fn refusal(&self, asked: Admission) -> Result<Option<Refusal>> {
+        let cfg = self.cfg()?;
+        let host = self.host()?;
+        let standing = Standing {
+            // A runner started by hand was given no token by this object.
+            issued: matches!(host, Host::Container(_))
+                .then(|| self.session.borrow().token_expires_at),
+            running: host.running(),
+            used: self.store.usage(today())?,
+            budget: cfg.daily_token_budget,
+        };
+        Ok(calls::refusal(asked, standing))
     }
 
     /// Changes the session and writes it back.
@@ -1277,6 +1304,15 @@ impl Inner {
             render::permission_prompt(&request_id, &tool_name, &input)
         };
         let bot = Bot::new(&cfg);
+        // An answer covers all of a request, so one too long for its prompt goes ahead
+        // of it as a file. If that cannot be sent the user is not asked, and the request
+        // is declined like any other that could not be shown.
+        if tool_name != ASK_USER_QUESTION
+            && let Some(whole) = render::permission_overflow(&tool_name, &input)
+        {
+            bot.send_document(self.chat_id(), render::REQUEST_FILE, whole.as_bytes())
+                .await?;
+        }
         let message_id = bot
             .send_message(self.chat_id(), &html, Some(&keyboard))
             .await?;

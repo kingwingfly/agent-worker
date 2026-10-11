@@ -18,7 +18,8 @@ enabled = true
 #   TELEGRAM_BOT_TOKEN       from @BotFather
 #   TELEGRAM_WEBHOOK_SECRET  any random string; also given to Telegram's setWebhook
 #   LLM_API_KEY              credential for the LLM gateway
-#   SESSION_TOKEN_SECRET     any long random string; signs the tokens containers hold
+#   SESSION_TOKEN_SECRET     a random string of 16 characters or more; signs the tokens
+#                            containers hold
 [vars]
 # Where agent containers reach this Worker.
 PUBLIC_ORIGIN = "https://agent-worker.example.workers.dev"
@@ -26,7 +27,8 @@ PUBLIC_ORIGIN = "https://agent-worker.example.workers.dev"
 LLM_BASE_URL = "https://llm-gateway.example.com"
 # "bearer" sends `Authorization: Bearer <LLM_API_KEY>`, "x-api-key" sends that header.
 LLM_AUTH_STYLE = "bearer"
-# Model ids as the gateway names them. SMALL_MODEL serves background requests.
+# Model ids as the gateway names them. SMALL_MODEL serves background requests. With both
+# set, the /llm proxy refuses a call for any other model.
 MODEL = "claude-sonnet-5-5"
 SMALL_MODEL = "claude-haiku-5-5"
 # Comma separated Telegram user ids, or "*" for anyone. Empty admits nobody.
@@ -35,7 +37,8 @@ ALLOWED_TG_USERS = ""
 IDLE_TTL_SECS = "120"
 APPROVAL_TIMEOUT_SECS = "600"
 TURN_TIMEOUT_SECS = "1800"
-# Fresh tokens (cache reads excluded) per chat per UTC day; "0" is unlimited.
+# Fresh tokens (cache reads excluded) per chat per UTC day; "0" is unlimited. Model calls
+# are refused once it is used up, in the middle of a turn too.
 DAILY_TOKEN_BUDGET = "0"
 MCP_IDLE_TTL_SECS = "900"
 
