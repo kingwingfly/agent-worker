@@ -1,8 +1,8 @@
 [workspace]
 resolver = "3"
-members = ["crates/proto", "crates/runner", "crates/gateway", "crates/mcp-example"]
+members = ["crates/proto", "crates/runner", "crates/gateway", "crates/mcp-example", "crates/mcp-front"]
 # The gateway is built for wasm32 by `worker-build`; see the README.
-default-members = ["crates/proto", "crates/runner", "crates/mcp-example"]
+default-members = ["crates/proto", "crates/runner", "crates/mcp-example", "crates/mcp-front"]
 
 [workspace.package]
 version = "0.1.0"
