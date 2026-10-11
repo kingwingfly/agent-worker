@@ -51,6 +51,10 @@ COPY containers/agent/md2pdf/md2pdf /usr/local/bin/md2pdf
 COPY containers/agent/mcp-file /usr/local/bin/mcp-file
 COPY containers/agent/md2pdf/defaults.yaml containers/agent/md2pdf/header.typ \
      containers/agent/md2pdf/tidy.lua /etc/agent/md2pdf/
+# The agent's like everything else in its working directory. All of that directory is
+# read as the agent to save it after a turn, so one file there that it could not read
+# would stop every save.
+COPY --chown=agent:agent containers/agent/CLAUDE_agent.md /work/CLAUDE.md
 COPY --chown=agent:agent skills/ /home/agent/.claude/skills/
 # Claude keeps its transcripts and settings here, so it has to own all of it whichever
 # way the builder created the directories above.
@@ -61,14 +65,10 @@ COPY --chown=agent:agent skills/ /home/agent/.claude/skills/
 # be, arrived closed to the agent, which is not root. Claude Code does not start
 # without a prompt file or a settings file it was told to read.
 RUN chown -R agent:agent /home/agent/.claude \
- && chmod -R u=rwX,go=rX /etc/claude-code /etc/agent /home/agent/.claude/skills \
+ && chmod -R u=rwX,go=rX /etc/claude-code /etc/agent /home/agent/.claude/skills /work/CLAUDE.md \
  && chmod 755 /usr/local/bin/md2pdf /usr/local/bin/mcp-file
 
 USER agent
-# Fail the build, not every request, if a file added above later is one the agent cannot
-# read.
-RUN closed=$(find /etc/claude-code /etc/agent /home/agent/.claude ! -readable) \
- && [ -z "$closed" ] || { echo "the agent cannot read: $closed" >&2; exit 1; }
 # Fail the build, not a user's request, if the PDF toolchain does not fit together. The
 # picture is there because header.typ measures every picture to decide its size.
 RUN printf '<svg xmlns="http://www.w3.org/2000/svg" width="900" height="1600"/>' > /tmp/check.svg \
@@ -87,7 +87,11 @@ RUN python3 -c 'import json; s = json.load(open("/etc/agent/settings.json")); as
 ENV HOME=/home/agent \
     PATH=/home/agent/.local/bin:/usr/local/bin:/usr/bin:/bin \
     CLAUDE_CONFIG_DIR=/home/agent/.claude
-COPY containers/agent/CLAUDE_agent.md /work/CLAUDE.md
+# Last, so that it covers every COPY above: fail the build, not every request, if the
+# agent has been given a file it cannot read. COPY makes a file root's whichever USER
+# is in effect, and keeps the mode it has in the checkout.
+RUN closed=$(find /etc/claude-code /etc/agent /home/agent/.claude /work ! -readable) \
+ && [ -z "$closed" ] || { echo "the agent cannot read: $closed" >&2; exit 1; }
 WORKDIR /work
 EXPOSE 8080
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/runner"]
