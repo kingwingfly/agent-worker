@@ -32,7 +32,7 @@ Telegram ──webhook──▶ Worker
 2. The session starts its container if needed, restores the previous files and transcript from R2, and opens a WebSocket to the runner.
 3. The runner feeds the message to a long-lived `claude -p --input-format stream-json` and streams events back. The session shows the tools Claude uses, and what it says before using them, in one progress message that it edits as it goes and leaves in the chat. When a prompt or a message of the user's has pushed it up the chat, it is sent again below them, so the newest message is the one that changes.
 4. A tool call that the policy does not pre-approve reaches the runner's `permission_prompt` MCP tool (`--permission-prompt-tool`). It becomes a Telegram message with **Allow / Always / Deny** buttons; Claude waits for the answer. `AskUserQuestion` arrives the same way and is shown as option buttons.
-5. When the turn ends, the answer is sent, files written to `/work/out/` are delivered as documents, and the state is saved to R2. The container is stopped after `IDLE_TTL_SECS`.
+5. When the turn ends, the answer is sent, every file created or changed under `/work/out/` during the turn is delivered as a document, and the state is saved to R2. The container is stopped after `IDLE_TTL_SECS`.
 
 ### Conversations and going back
 
@@ -188,6 +188,8 @@ The agent never writes a typesetting language. It writes Markdown and runs `md2p
 - `tidy.lua`: repairs for Markdown as models tend to write it. `<br>` becomes a line break, real HTML tags are removed, other text in angle brackets such as `<customer name>` is printed, and rows of `| a | b |` written without a header become a table instead of text full of pipes.
 
 A line break in the Markdown is a line break in the PDF (`hard_line_breaks`), as in a chat window, so an address block written one item per line stays that way.
+
+Nothing asks the user before a file in `/work/out` is sent, and it does not matter how it got there: a prompt for `mv notes.md /work/out` is a prompt for a shell command, and says nothing about delivery. So the agent is told to keep its working files in `/work`, by the system prompt, by the skill and by `md2pdf` itself, which says when it has written a PDF that the user is about to receive it and that nothing is left to move.
 
 To try a change without building the image, install pandoc and Typst and run `MD2PDF_HOME=containers/agent/md2pdf MD2PDF_OUT_DIR=. containers/agent/md2pdf/md2pdf some.md`.
 
