@@ -75,6 +75,7 @@ RUN python3 -c 'import json; s = json.load(open("/etc/agent/settings.json")); as
 ENV HOME=/home/agent \
     PATH=/home/agent/.local/bin:/usr/local/bin:/usr/bin:/bin \
     CLAUDE_CONFIG_DIR=/home/agent/.claude
+COPY containers/agent/CLAUDE_agent.md /work/CLAUDE.md
 WORKDIR /work
 EXPOSE 8080
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/runner"]
