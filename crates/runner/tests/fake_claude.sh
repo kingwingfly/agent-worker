@@ -2,6 +2,7 @@
 # Stand-in for `claude -p --input-format stream-json --output-format stream-json`.
 # Records its arguments, then answers each user message with a canned event sequence.
 # Keywords in the message select a behaviour: pdf, crash, slow, stale, linger, sluggish.
+# A control request is answered, and the effort it sets is recorded.
 
 printf '%s\n' "$@" > "$CLAUDE_CONFIG_DIR/args"
 
@@ -10,6 +11,12 @@ trap 'kill $! 2>/dev/null
       exit 130' INT
 
 while IFS= read -r line; do
+  if [[ $line == *'"type":"control_request"'* ]]; then
+    sed -n 's/.*"effortLevel":"\{0,1\}\([a-z]*\).*/\1/p' <<<"$line" >> "$CLAUDE_CONFIG_DIR/efforts"
+    request_id=$(sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p' <<<"$line")
+    echo "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"$request_id\"}}"
+    continue
+  fi
   text=$(sed -n 's/.*"text":"\([^"]*\)".*/\1/p' <<<"$line")
   uuid=$(sed -n 's/.*"uuid":"\([^"]*\)".*/\1/p' <<<"$line")
   echo '{"type":"system","subtype":"init"}'

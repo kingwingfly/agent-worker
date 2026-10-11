@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use wasm_bindgen::JsValue;
 use worker::{Delay, Fetch, Headers, Method, Request, RequestInit, Result, js_sys::Uint8Array};
 
-use crate::{config::Config, platform::error, render};
+use crate::{config::Config, platform::error, render, scrub};
 
 const RATE_LIMIT_RETRIES: u32 = 2;
 /// Longer waits are not sat out: the caller is usually holding up a session's event loop.
@@ -14,12 +14,15 @@ const RATE_LIMIT_MAX_WAIT_SECS: u64 = 5;
 
 pub struct Bot {
     base: String,
+    /// This Worker's host, which is never shown in the chat; see [`scrub::redact`].
+    hidden: String,
 }
 
 impl Bot {
     pub fn new(cfg: &Config) -> Self {
         Self {
             base: format!("{}/bot{}", cfg.telegram_api, cfg.bot_token),
+            hidden: scrub::host_of(&cfg.public_origin).to_owned(),
         }
     }
 
@@ -67,6 +70,7 @@ impl Bot {
         html: &str,
         keyboard: Option<&Value>,
     ) -> Result<i64> {
+        let html = &scrub::redact(html, &self.hidden);
         let mut payload = json!({
             "chat_id": chat_id,
             "text": html,
@@ -100,6 +104,7 @@ impl Bot {
         html: &str,
         keyboard: Option<&Value>,
     ) -> Result<()> {
+        let html = &scrub::redact(html, &self.hidden);
         let mut payload = json!({
             "chat_id": chat_id,
             "message_id": message_id,

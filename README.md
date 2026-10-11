@@ -46,6 +46,27 @@ All three replace the container, so the next message starts one from the checkpo
 
 An alarm re-checks every 30 seconds while a turn is open, so an evicted Durable Object or a crashed container is picked up and the turn is run again. A new container is given the saved state before it runs anything; if that fails the turn is refused rather than run on an empty disk, and the saved copy is left as it is.
 
+### Long conversations
+
+Claude Code compacts a conversation on its own when it gets long: the older part is replaced by a summary and the turn goes on. `containers/agent/settings.json` makes sure of that in two ways.
+
+- `autoCompactEnabled` switches it on in a file the agent cannot write. Left unsaid it is on as well, but then a settings file in the agent's home directory can switch it off.
+- `autoCompactWindow` is the size it works from, 128,000 tokens. Compaction starts 33,000 below it, at 95,000. Without the setting Claude Code goes by the window it believes the model to have: 1,000,000 tokens for the current Claude models, so that it would compact at 967,000, and 200,000 for a model it does not know, whatever that model's window really is.
+
+Choose the window for the model in `MODEL`, and look at it again when that changes. It has to be no more than the context your gateway really gives the model. If the model costs more per token from some prompt size on, stay well below that size too: a turn is only checked between model calls, so one large tool result can carry a request some tens of thousands of tokens past the point where compaction starts. A smaller window also means less to pay for with every message, and more summaries. Claude Code takes nothing below 100,000 and ignores a smaller value without saying so, which would leave the model's own window in force; the image build fails on such a value for that reason.
+
+Claude Code measures a conversation by the token usage the gateway reports with each answer, the same reports the daily budget is counted from. A gateway that reports none leaves it to estimate.
+
+The summary is one more model call inside the turn that crosses the line. That turn takes longer, and the call is metered like any other. A conversation whose single exchange is already over the line cannot be compacted, because there is no older part to summarise.
+
+If the gateway refuses a request as too long before that point, Claude Code compacts and tries again, as long as the refusal is worded the way the Anthropic API words it (`prompt is too long: N tokens > M maximum`). The `/llm` proxy passes on exactly that wording and nothing else of the refusal.
+
+### Effort
+
+`/effort` is Claude Code's command of that name. On its own it lists the levels as buttons (`low`, `medium`, `high`, `xhigh`, `max`, and `auto` for the model's default), and `/effort high` sets one directly. The level belongs to the chat: the session keeps it, so it outlasts containers and `/new`, and `/status` shows it.
+
+The session hands the level to the runner with each message. A new `claude` is launched with `--effort`. One that is already running at another level is told just before the message, with the stream-json control request `apply_flag_settings` (`effortLevel`), so nothing is restarted and a change costs no time. Claude Code puts the level into every model call as `output_config.effort`, and it does that without `/effort` too, with its own default for the model; what a level changes is up to the model behind the gateway. A higher level uses more tokens, which count against `DAILY_TOKEN_BUDGET` like any others.
+
 ## Develop
 
 ```sh
@@ -61,7 +82,7 @@ RUNNER_WORK_DIR=/tmp/agent/work RUNNER_RUNTIME_DIR=/tmp/agent/run \
 cargo run -p agent-runner --example drive -- "Create out/hello.md containing one line: hi"
 ```
 
-`drive` approves permission requests (`--deny` to decline, `--interrupt-after-ms N` to interrupt, `--raw` for every frame). Without `AGENT_WORKER_ORIGIN` the CLI uses whatever credentials it already has.
+`drive` approves permission requests (`--deny` to decline, `--interrupt-after-ms N` to interrupt, `--effort LEVEL` to answer at a level, `--raw` for every frame). Without `AGENT_WORKER_ORIGIN` the CLI uses whatever credentials it already has.
 
 ### Run the Worker without a container engine
 
@@ -92,7 +113,7 @@ Needs a Workers Paid plan, Docker or podman for building the images, and `cargo 
 
 With podman, put `WRANGLER_DOCKER_BIN="$PWD/containers/docker-via-podman"` in front of the `wrangler deploy` command below. The wrapper adapts what podman does differently from Docker: two `build` arguments, and the image digest reported after a push, which wrangler uses to tell Cloudflare what to run. Rootless podman needs subordinate id ranges for your user (`grep "^$USER:" /etc/subuid /etc/subgid`), or installing packages inside the image build fails.
 
-1. Edit `[vars]` in `wrangler.toml`: `PUBLIC_ORIGIN`, `LLM_BASE_URL`, `MODEL`, `SMALL_MODEL`, `ALLOWED_TG_USERS`. `PUBLIC_ORIGIN` must be an address the Worker is really served at, because the agent containers call it for every model and MCP request: either its `workers.dev` address, or your own domain declared under `routes` with `workers_dev = false`.
+1. Edit `[vars]` in `wrangler.toml`: `PUBLIC_ORIGIN`, `LLM_BASE_URL`, `MODEL`, `SMALL_MODEL`, `ALLOWED_TG_USERS`. For a model other than the default, see "Long conversations" above for the size at which conversations are compacted. `PUBLIC_ORIGIN` must be an address the Worker is really served at, because the agent containers call it for every model and MCP request: either its `workers.dev` address, or your own domain declared under `routes` with `workers_dev = false`.
 2. Create the bucket and set the secrets:
    ```sh
    npx wrangler r2 bucket create agent-worker-state
@@ -187,10 +208,16 @@ To try a change without building the image, install pandoc and Typst and run `MD
 - The runner's control API needs a secret the session sets before any agent process exists, and the runner makes its own memory unreadable to the agent, so the agent cannot approve its own prompts.
 - The permission policy is a root-owned managed settings file. Settings the agent writes in its working directory are not loaded.
 - Containers currently have outbound internet access. An approved shell command can therefore send data anywhere; keep the pre-approved list short.
+- Nothing a failed model call says reaches a container or the chat. A gateway's error names its site and quotes the ids it knows the request by, and Claude Code prints such an error into its answer word for word. So the `/llm` proxy rebuilds every error from its status and its kind (`crates/gateway/src/scrub.rs`): an error status, an `error` event inside a stream, and a status 200 whose body is an error or a page of the gateway's. It also drops every response header but the five that say what the body is and when to retry. The gateway's own words go to the Worker's log, with the chat they belong to, which is where to look when a user reports "The model service had an internal error". The bot, for its part, never shows this Worker's host, which Claude Code adds to some of its messages.
+- What a successful model call returns is passed on as it is, ids and model name included. It is not shown in the chat, but it is in the transcript inside the container, which the agent can read.
 
 ## Upgrading Claude Code
 
-The runner relies on `--permission-prompt-tool`, `--input-format stream-json`, `--replay-user-messages` and `--resume`. After changing `CLAUDE_CODE_VERSION`, run the runner against the new CLI and check with `drive` that: a non-approved Bash command produces a permission request and runs when allowed; a second prompt in the same run gets its own result; an interrupt ends the turn and the next prompt still works; restarting the runner resumes the conversation.
+The runner relies on `--permission-prompt-tool`, `--input-format stream-json`, `--replay-user-messages`, `--resume`, `--effort` and the `apply_flag_settings` control request. After changing `CLAUDE_CODE_VERSION`, run the runner against the new CLI and check with `drive` that: a non-approved Bash command produces a permission request and runs when allowed; a second prompt in the same run gets its own result; an interrupt ends the turn and the next prompt still works; restarting the runner resumes the conversation; a `drive --raw --effort high` after a run without `--effort` shows a `control_response` whose `subtype` is `success`.
+
+Check that `claude -p /context --settings containers/agent/settings.json` still reports a window of 128k and an autocompact buffer: the two settings that keep long conversations compacted are read from that file, and a setting Claude Code no longer knows is ignored without a word.
+
+Check as well that `claude --help` still lists the levels of `Effort` in `crates/proto` for `--effort`. The CLI accepts a level it does not know without an error and goes on at its default, so a renamed level would not show anywhere else.
 
 ## Not built yet
 

@@ -3,5 +3,7 @@
   "skillOverrides": {
     "doctor": "off",
     "plugin-authoring": "off"
-  }
+  },
+  "autoCompactEnabled": true,
+  "autoCompactWindow": 128000
 }

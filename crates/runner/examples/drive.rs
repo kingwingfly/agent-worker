@@ -8,6 +8,7 @@
 //!
 //! - `--addr HOST:PORT`: where the runner listens (default `127.0.0.1:8080`)
 //! - `--deny`: decline permission requests instead of allowing them
+//! - `--effort LEVEL`: answer at this level (`low` to `max`) instead of the CLI's default
 //! - `--interrupt-after-ms N`: interrupt each turn N milliseconds after it starts
 //! - `--raw`: print every frame as JSON
 //!
@@ -15,7 +16,7 @@
 
 use std::time::Duration;
 
-use agent_proto::{Decision, FromRunner, ToRunner};
+use agent_proto::{Decision, Effort, FromRunner, ToRunner};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio_tungstenite::{
@@ -72,12 +73,17 @@ async fn main() -> anyhow::Result<()> {
     let mut addr = "127.0.0.1:8080".to_owned();
     let (mut deny, mut raw) = (false, false);
     let mut interrupt_after = None;
+    let mut effort = None;
     let mut prompts = Vec::new();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--addr" => addr = args.next().expect("--addr needs a value"),
             "--deny" => deny = true,
+            "--effort" => {
+                let level = args.next().expect("--effort needs a value");
+                effort = Some(Effort::parse(&level).expect("--effort takes low to max"));
+            }
             "--interrupt-after-ms" => {
                 let millis = args.next().expect("--interrupt-after-ms needs a value");
                 interrupt_after = Some(Duration::from_millis(millis.parse()?));
@@ -151,6 +157,7 @@ async fn main() -> anyhow::Result<()> {
                 Some(ToRunner::UserMessage {
                     turn_id: format!("{run}-{index}"),
                     text,
+                    effort,
                 })
             }
             FromRunner::PermissionRequest {

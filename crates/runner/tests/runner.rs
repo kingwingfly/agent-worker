@@ -2,7 +2,7 @@
 
 use std::{fs, path::PathBuf, time::Duration};
 
-use agent_proto::{Decision, FromRunner, ToRunner, TurnResult, Usage};
+use agent_proto::{Decision, Effort, FromRunner, ToRunner, TurnResult, Usage};
 use agent_runner::{Config, Runner};
 use futures_util::{SinkExt, StreamExt};
 use reqwest::StatusCode;
@@ -147,9 +147,14 @@ async fn expect_silence(socket: &mut Socket) {
 }
 
 async fn user_message(socket: &mut Socket, turn_id: &str, text: &str) {
+    user_message_at(socket, turn_id, text, None).await;
+}
+
+async fn user_message_at(socket: &mut Socket, turn_id: &str, text: &str, effort: Option<Effort>) {
     let frame = ToRunner::UserMessage {
         turn_id: turn_id.into(),
         text: text.into(),
+        effort,
     };
     send(socket, frame).await;
 }
@@ -450,6 +455,59 @@ async fn a_message_sent_to_an_exiting_claude_is_delivered_to_its_replacement() {
     user_message(&mut socket, "t2", "still there?").await;
     let (_, result) = finish_turn(&mut socket).await;
     assert_eq!(result.text.as_deref(), Some("echo: still there?"));
+}
+
+#[tokio::test]
+async fn a_change_of_effort_reaches_the_running_claude_and_a_new_one_starts_at_it() {
+    let harness = Harness::claimed().await;
+    let (mut socket, _) = harness.connect().await;
+    // What the fake CLI wrote to `file` since this was last asked.
+    let recorded = |file: &str| {
+        let path = harness.cfg.claude_config_dir.join(file);
+        let lines = fs::read_to_string(&path).unwrap_or_default();
+        let _ = fs::remove_file(&path);
+        lines.lines().map(str::to_owned).collect::<Vec<_>>()
+    };
+    // `--effort` at each launch, where `[]` means that the process stayed and `[None]`
+    // that one was launched with the level left to the CLI.
+    let launches = || match recorded("args").as_slice() {
+        [] => Vec::new(),
+        args => {
+            let effort = args.windows(2).find(|pair| pair[0] == "--effort");
+            vec![effort.map(|pair| pair[1].clone())]
+        }
+    };
+    let changes = || recorded("efforts");
+    let mut turns = 0;
+    let mut answer = async |text: &str, effort| {
+        turns += 1;
+        user_message_at(&mut socket, &format!("t{turns}"), text, effort).await;
+        finish_turn(&mut socket).await.1
+    };
+
+    let result = answer("hello", None).await;
+    assert_eq!(result.text.as_deref(), Some("echo: hello"));
+    assert_eq!((launches(), changes()), (vec![None], vec![]));
+
+    // The process is told, not replaced, and the message after it is answered as ever.
+    let result = answer("hello", Some(Effort::High)).await;
+    assert_eq!(result.text.as_deref(), Some("echo: hello"));
+    assert_eq!((launches(), changes()), (vec![], vec!["high".to_owned()]));
+    // Once is enough.
+    answer("hello", Some(Effort::High)).await;
+    assert_eq!((launches(), changes()), (vec![], vec![]));
+    // Back to the CLI's own choice.
+    answer("hello", None).await;
+    assert_eq!((launches(), changes()), (vec![], vec!["null".to_owned()]));
+
+    // A process launched while a level is set starts at it and needs no telling.
+    assert_eq!(answer("crash now", None).await.subtype, "runner_error");
+    let result = answer("hello", Some(Effort::Max)).await;
+    assert_eq!(result.text.as_deref(), Some("echo: hello"));
+    assert_eq!(
+        (launches(), changes()),
+        (vec![Some("max".to_owned())], vec![])
+    );
 }
 
 #[tokio::test]

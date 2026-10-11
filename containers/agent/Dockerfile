@@ -44,7 +44,8 @@ COPY --from=build /src/target/release/runner /usr/local/bin/runner
 # Root-owned, so the agent cannot rewrite its own permissions or instructions.
 COPY containers/agent/managed-settings.json /etc/claude-code/managed-settings.json
 COPY containers/agent/system.md /etc/agent/system.md
-# Switches off the skills that ship with Claude Code, so the agent sees only ours.
+# Switches off the skills that ship with Claude Code, so the agent sees only ours, and
+# has long conversations compacted, at a size that does not depend on the model's name.
 COPY containers/agent/settings.json /etc/agent/settings.json
 COPY containers/agent/md2pdf/md2pdf /usr/local/bin/md2pdf
 COPY containers/agent/mcp-file /usr/local/bin/mcp-file
@@ -63,6 +64,9 @@ RUN printf '# Check\n\n| a | b |\n|---|---|\n| 中文 | ok |\n' > /tmp/check.md 
 # The file helper has to be runnable, and to refuse what is not a file before it
 # contacts anything.
 RUN mcp-file get .. 2>/dev/null; [ "$?" -eq 1 ]
+# Claude Code ignores a compaction window it finds too small, without a word, and then
+# lets conversations grow to whatever it takes the model's own window to be.
+RUN python3 -c 'import json; s = json.load(open("/etc/agent/settings.json")); assert s.get("autoCompactEnabled") is True and s.get("autoCompactWindow", 0) >= 100000, "settings.json: Claude Code ignores an autoCompactWindow below 100000"'
 ENV HOME=/home/agent \
     PATH=/home/agent/.local/bin:/usr/local/bin:/usr/bin:/bin \
     CLAUDE_CONFIG_DIR=/home/agent/.claude

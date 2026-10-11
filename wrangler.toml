@@ -57,7 +57,7 @@ new_sqlite_classes = ["SessionDO", "McpHostDO"]
 class_name = "SessionDO"
 image = "./containers/agent/Dockerfile"
 image_build_context = "."
-instance_type = "standard-1"
+instance_type = "basic"
 max_instances = 20
 
 # The MCP server every agent shares.
@@ -65,7 +65,7 @@ max_instances = 20
 class_name = "McpHostDO"
 image = "./containers/mcp/Dockerfile"
 image_build_context = "."
-instance_type = "basic"
+instance_type = "lite"
 max_instances = 1
 
 # Session state archives and the files agents produce.
