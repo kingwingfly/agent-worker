@@ -19,8 +19,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use wasm_bindgen::{JsValue, UnwrapThrowExt};
 use worker::{
-    Container, Delay, DurableObject, Env, Fetch, FixedLengthStream, Headers, Method, Request,
-    RequestInit, Response, ResponseBody, Result, State, Url, WebSocket, WebsocketEvent,
+    Bucket, Container, Delay, DurableObject, Env, Fetch, FixedLengthStream, Headers, Method,
+    Request, RequestInit, Response, ResponseBody, Result, State, Url, WebSocket, WebsocketEvent,
     console_error, console_warn, durable_object, js_sys::Uint8Array, wasm_bindgen_futures,
 };
 
@@ -31,8 +31,8 @@ use crate::{
     mcp_host::{MCP_BINDING, MCP_INSTANCE, WARM_PATH},
     platform::{error, expect_ok, now_ms, random_uuid},
     remember,
-    render::{self, Callback, Status},
-    store::{Approval, Store},
+    render::{self, Callback, Pick, Status},
+    store::{Approval, Checkpoint, Store},
     update::{CallbackQuery, Update},
 };
 
@@ -66,9 +66,16 @@ const TELEGRAM_FILE_LIMIT: u64 = 10 * 1024 * 1024;
 /// Pauses before each attempt at sending a message that must arrive.
 const DELIVERY_BACKOFF_MS: [u64; 3] = [0, 2_000, 8_000];
 const MS_PER_DAY: u64 = 86_400_000;
+/// Checkpoints kept for a conversation. The oldest of them is only what the next one
+/// started from, so one turn fewer can be undone.
+const CHECKPOINTS_KEPT: usize = 10;
+/// Conversations kept for a chat, the one it is in included.
+const CONVERSATIONS_KEPT: usize = 10;
 
 const HELP: &str = "Send me a message and I'll get to work.\n\n\
     /new — start a fresh conversation\n\
+    /resume — go back to an earlier conversation\n\
+    /rewind — go back to before one of your messages\n\
     /stop — stop what I'm doing\n\
     /status — what I'm doing and today's usage";
 
@@ -82,8 +89,13 @@ struct Session {
     control_secret: String,
     /// Unix seconds at which the current container's session token expires.
     token_expires_at: u64,
-    /// A state archive for this session exists in R2.
+    /// A state archive for the conversation exists in R2.
     has_state: bool,
+    /// The checkpoint that archive is: what the conversation was last saved as, and what
+    /// a new container is restored from. Zero while `has_state` is set means a state
+    /// saved before conversations had checkpoints.
+    #[serde(default)]
+    checkpoint: u64,
     /// The current container was started with an empty disk and has not been given the
     /// archive yet. Until it has, it must neither run a turn nor be saved from: saving
     /// would replace the archive with nothing.
@@ -178,6 +190,8 @@ struct Live {
     status: Status,
     last_status_edit_ms: u64,
     unacked_events: u32,
+    /// The chat is being moved to another conversation, or to another point in this one.
+    switching: bool,
 }
 
 struct Inner {
@@ -233,6 +247,17 @@ impl DurableObject for SessionDO {
     }
 }
 
+/// Where a conversation as it was after one of its turns is kept. Checkpoints are named
+/// by the time they were saved at, so a name is never used twice.
+fn checkpoint_key(name: &str, conversation: &str, at_ms: u64) -> String {
+    format!("sessions/{name}/{conversation}/{at_ms}.tar.gz")
+}
+
+/// Where a chat's one saved state was kept before conversations had checkpoints.
+fn legacy_state_key(name: &str) -> String {
+    format!("sessions/{name}/state.tar.gz")
+}
+
 fn today() -> u64 {
     now_ms() / MS_PER_DAY
 }
@@ -270,8 +295,24 @@ impl Inner {
         self.session.borrow().chat_id
     }
 
+    /// Where the conversation's saved state is.
     fn state_key(&self) -> String {
-        format!("sessions/{}/state.tar.gz", self.session.borrow().name)
+        let session = self.session.borrow();
+        match session.checkpoint {
+            0 => legacy_state_key(&session.name),
+            at_ms => checkpoint_key(&session.name, &session.claude_session_id, at_ms),
+        }
+    }
+
+    /// Why nothing that replaces the conversation's files can be done right now.
+    fn busy(&self) -> Option<&'static str> {
+        if self.turn().is_some() {
+            Some("Stop the current task with /stop first.")
+        } else if self.live.borrow().switching {
+            Some("One moment, I'm still switching. Try again.")
+        } else {
+            None
+        }
     }
 
     async fn arm(&self, delay_ms: u64) {
@@ -359,21 +400,30 @@ impl Inner {
             .next()
             .filter(|word| word.starts_with('/'))
             .map(|word| word.split('@').next().unwrap_or(word));
-        let reply = match command {
+        let (reply, keyboard) = match command {
             None => return self.begin_turn(cfg, bot, text).await,
-            Some("/start" | "/help") => HELP.to_owned(),
-            Some("/new") => self.reset().await?,
-            Some("/stop") => self.stop(cfg, bot).await,
-            Some("/status") => self.describe(cfg)?,
-            Some(other) => format!("I don't know {}.\n\n{HELP}", render::escape(other)),
+            Some("/start" | "/help") => (HELP.to_owned(), None),
+            Some("/new") => (self.reset().await?, None),
+            Some("/resume") => self.offer_resume()?,
+            Some("/rewind") => self.offer_rewind()?,
+            Some("/stop") => (self.stop(cfg, bot).await, None),
+            Some("/status") => (self.describe(cfg)?, None),
+            Some(other) => (
+                format!("I don't know {}.\n\n{HELP}", render::escape(other)),
+                None,
+            ),
         };
-        bot.send_message(chat_id, &reply, None).await.map(drop)
+        bot.send_message(chat_id, &reply, keyboard.as_ref())
+            .await
+            .map(drop)
     }
 
     async fn begin_turn(self: &Rc<Self>, cfg: &Config, bot: &Bot, text: &str) -> Result<()> {
         let chat_id = self.chat_id();
         let refusal = if self.turn().is_some() {
             Some("I'm still working on your previous message. Send /stop to cancel it.")
+        } else if self.live.borrow().switching {
+            Some("One moment, I'm still switching. Send that again.")
         } else if cfg.daily_token_budget > 0 && self.store.usage(today())? >= cfg.daily_token_budget
         {
             Some("Today's usage limit for this chat is used up. Try again tomorrow.")
@@ -439,28 +489,229 @@ impl Inner {
         Ok(())
     }
 
-    /// `/new`: forget the conversation and its files.
+    /// `/new`: begin a fresh conversation. The one left behind stays where `/resume`
+    /// finds it.
     async fn reset(&self) -> Result<String> {
-        if self.turn().is_some() {
-            return Ok("Stop the current task with /stop first.".into());
+        if let Some(busy) = self.busy() {
+            return Ok(busy.into());
         }
-        self.live.borrow_mut().socket = None;
-        if let Ok(host) = self.host() {
-            host.stop().await?;
-        }
-        self.env
-            .bucket(STATE_BUCKET)?
-            .delete(self.state_key())
+        let unkept = self
+            .switch(|| {
+                self.store.clear_approvals()?;
+                self.store.forget_all()?;
+                Ok(self.update(|session| {
+                    // A state saved before conversations had checkpoints belongs to none
+                    // that could be resumed, so it goes as it always did.
+                    let unkept = (session.has_state && session.checkpoint == 0)
+                        .then(|| legacy_state_key(&session.name));
+                    session.claude_session_id = random_uuid();
+                    session.has_state = false;
+                    session.checkpoint = 0;
+                    session.needs_restore = false;
+                    session.last_seq = 0;
+                    unkept
+                }))
+            })
             .await?;
-        self.store.clear_approvals()?;
-        self.store.forget_all()?;
-        self.update(|session| {
-            session.claude_session_id = random_uuid();
-            session.has_state = false;
-            session.needs_restore = false;
-            session.last_seq = 0;
-        });
-        Ok("Started a fresh conversation.".into())
+        self.discard(unkept).await;
+        Ok("Started a fresh conversation. /resume goes back to an earlier one.".into())
+    }
+
+    // ----- Earlier conversations, and earlier points in this one -----
+
+    /// Stops the container, whose files are the conversation as it is now, and then
+    /// makes `change` to what the session says the conversation is. No turn may begin in
+    /// between: it would run on the files of one state and be saved as another.
+    async fn switch<T>(&self, change: impl FnOnce() -> Result<T>) -> Result<T> {
+        {
+            let mut live = self.live.borrow_mut();
+            live.switching = true;
+            live.socket = None;
+        }
+        let stopped = match self.host() {
+            Ok(host) => host.stop().await,
+            Err(_) => Ok(()),
+        };
+        let outcome = stopped.and_then(|()| change());
+        self.live.borrow_mut().switching = false;
+        outcome
+    }
+
+    /// Deletes archives nothing refers to any more. One that cannot be deleted is only
+    /// left behind, so this is nobody's error.
+    async fn discard(&self, keys: impl IntoIterator<Item = String>) {
+        let Ok(bucket) = self.env.bucket(STATE_BUCKET) else {
+            return;
+        };
+        for key in keys {
+            if let Err(error) = bucket.delete(&key).await {
+                console_error!("deleting {key} failed: {error}");
+            }
+        }
+    }
+
+    /// `/resume`: the chat's other conversations, to pick one from.
+    fn offer_resume(&self) -> Result<(String, Option<Value>)> {
+        if let Some(busy) = self.busy() {
+            return Ok((busy.into(), None));
+        }
+        let current = self.session.borrow().claude_session_id.clone();
+        let saved = self.store.conversations()?;
+        Ok(match render::resume_picker(&saved, &current, now_ms()) {
+            Some((html, keyboard)) => (html, Some(keyboard)),
+            None => (
+                "There is no earlier conversation to go back to.".into(),
+                None,
+            ),
+        })
+    }
+
+    /// `/rewind`: the user's recent messages in this conversation, to pick one from.
+    fn offer_rewind(&self) -> Result<(String, Option<Value>)> {
+        if let Some(busy) = self.busy() {
+            return Ok((busy.into(), None));
+        }
+        let current = self.session.borrow().claude_session_id.clone();
+        let kept = self.store.checkpoints(&current)?;
+        Ok(match render::rewind_picker(&current, &kept, now_ms()) {
+            Some((html, keyboard)) => (html, Some(keyboard)),
+            None => ("There is nothing to rewind yet.".into(), None),
+        })
+    }
+
+    /// A press on the `/resume` or `/rewind` list.
+    async fn on_pick(&self, bot: &Bot, query: &CallbackQuery, pick: Pick) -> Result<()> {
+        if let Some(busy) = self.busy() {
+            return bot.answer_callback(&query.id, Some(busy)).await;
+        }
+        let done = match &pick {
+            Pick::Resume { conversation } => self.resume(conversation).await?,
+            Pick::Rewind {
+                conversation,
+                checkpoint,
+            } => self.rewind(conversation, *checkpoint).await?,
+        };
+        let Some(html) = done else {
+            return bot
+                .answer_callback(&query.id, Some("This is no longer open."))
+                .await;
+        };
+        let _ = bot.answer_callback(&query.id, None).await;
+        // The list turns into the record of what was picked from it.
+        match &query.message {
+            Some(list) => {
+                bot.edit_message(self.chat_id(), list.message_id, &html, None)
+                    .await
+            }
+            None => bot
+                .send_message(self.chat_id(), &html, None)
+                .await
+                .map(drop),
+        }
+    }
+
+    /// Makes an earlier conversation the one the chat is in. Returns what to say, or
+    /// `None` if that conversation is not kept any more.
+    async fn resume(&self, id: &str) -> Result<Option<String>> {
+        let Some(conversation) = self.store.conversation(id)? else {
+            return Ok(None);
+        };
+        let last = self.store.checkpoints(id)?.into_iter().next();
+        if self.session.borrow().claude_session_id != id {
+            self.switch(|| {
+                self.store.clear_approvals()?;
+                self.store.forget_all()?;
+                // Used now, which also makes it the last to be dropped for its age.
+                self.store.set_head(id, conversation.head, now_ms())?;
+                self.update(|session| {
+                    session.claude_session_id = id.to_owned();
+                    session.has_state = true;
+                    session.checkpoint = conversation.head;
+                    session.needs_restore = false;
+                    session.last_seq = 0;
+                });
+                Ok(())
+            })
+            .await?;
+        }
+        let last = last.as_ref().map(|last| last.text.as_str());
+        Ok(Some(render::resumed(&conversation, last)))
+    }
+
+    /// Takes the conversation back to before the turn that `checkpoint` was saved after.
+    /// Returns what to say, or `None` if the list the press came from is out of date.
+    async fn rewind(&self, conversation: &str, checkpoint: u64) -> Result<Option<String>> {
+        let name = {
+            let session = self.session.borrow();
+            if session.claude_session_id != conversation {
+                return Ok(None);
+            }
+            session.name.clone()
+        };
+        let kept = self.store.checkpoints(conversation)?;
+        let Some((undone, Some(parent))) = render::rewindable(&kept)
+            .into_iter()
+            .find(|kept| kept.at_ms == checkpoint)
+            .map(|kept| (kept.text.clone(), kept.parent))
+        else {
+            return Ok(None);
+        };
+        // That turn and every later one.
+        let dropped: Vec<u64> = kept
+            .iter()
+            .map(|kept| kept.at_ms)
+            .filter(|at_ms| *at_ms >= checkpoint)
+            .collect();
+        self.switch(|| {
+            if parent == 0 {
+                // Nothing of it is left to resume. It goes on under the same id.
+                self.store.delete_conversation(conversation)?;
+            } else {
+                for at_ms in &dropped {
+                    self.store.delete_checkpoint(conversation, *at_ms)?;
+                }
+                self.store.set_head(conversation, parent, now_ms())?;
+            }
+            self.update(|session| {
+                session.has_state = parent != 0;
+                session.checkpoint = parent;
+                session.needs_restore = false;
+                session.last_seq = 0;
+            });
+            Ok(())
+        })
+        .await?;
+        // Checkpoints are named by when they were saved, so a later turn can never be
+        // saved under one of these names while they are being deleted.
+        let keys = dropped
+            .into_iter()
+            .map(|at_ms| checkpoint_key(&name, conversation, at_ms));
+        self.discard(keys).await;
+        Ok(Some(render::rewound(&undone)))
+    }
+
+    /// Drops what is kept beyond the limits: the conversation's oldest checkpoints, and
+    /// the conversations that were not used for longest. Returns their archives' keys.
+    fn prune(&self, name: &str, current: &str) -> Result<Vec<String>> {
+        let mut keys = Vec::new();
+        for old in self
+            .store
+            .checkpoints(current)?
+            .iter()
+            .skip(CHECKPOINTS_KEPT)
+        {
+            self.store.delete_checkpoint(current, old.at_ms)?;
+            keys.push(checkpoint_key(name, current, old.at_ms));
+        }
+        let others = self.store.conversations()?;
+        let others = others.iter().filter(|other| other.id != current);
+        for old in others.skip(CONVERSATIONS_KEPT - 1) {
+            for checkpoint in self.store.checkpoints(&old.id)? {
+                keys.push(checkpoint_key(name, &old.id, checkpoint.at_ms));
+            }
+            self.store.delete_conversation(&old.id)?;
+        }
+        Ok(keys)
     }
 
     /// `/stop`.
@@ -1015,6 +1266,9 @@ impl Inner {
         bot: &Bot,
         query: CallbackQuery,
     ) -> Result<()> {
+        if let Some(pick) = query.data.as_deref().and_then(Pick::parse) {
+            return self.on_pick(bot, &query, pick).await;
+        }
         let callback = query.data.as_deref().and_then(Callback::parse);
         let approval = match &callback {
             Some(callback) => self.store.approval(callback.request_id())?,
@@ -1249,7 +1503,7 @@ impl Inner {
                 ));
             }
         }
-        if let Err(error) = self.save_state().await {
+        if let Err(error) = self.save_state(turn).await {
             console_error!("saving session state failed: {error}");
             problems.push("I could not save this conversation; it may be forgotten.".to_owned());
         }
@@ -1328,13 +1582,27 @@ impl Inner {
         }
     }
 
-    /// Stores the runner's state archive, so the next container can pick up from here.
-    async fn save_state(&self) -> Result<()> {
-        if self.session.borrow().needs_restore {
-            return Err(error(
-                "this container never received the saved state; keeping the saved copy",
-            ));
-        }
+    /// Stores the runner's state archive as a new checkpoint of the conversation: what
+    /// the next container picks up from, and what `/rewind` and `/resume` go back to.
+    /// Earlier checkpoints are left as they are, so a save that fails loses nothing.
+    async fn save_state(&self, turn: &Turn) -> Result<()> {
+        let (name, conversation, parent) = {
+            let session = self.session.borrow();
+            if session.needs_restore {
+                return Err(error(
+                    "this container never received the saved state; keeping the saved copy",
+                ));
+            }
+            // What the turn started from. A state saved before there were checkpoints
+            // is replaced by this one, so there is no going back to it.
+            let parent =
+                (!session.has_state || session.checkpoint != 0).then_some(session.checkpoint);
+            (
+                session.name.clone(),
+                session.claude_session_id.clone(),
+                parent,
+            )
+        };
         let response = self.runner(Method::Get, "/state", None).await?;
         let mut response = expect_ok(response, "exporting session state").await?;
         let length = response
@@ -1343,9 +1611,31 @@ impl Inner {
             .and_then(|length| length.parse().ok())
             .ok_or_else(|| error("the state archive has no length"))?;
         let stream = FixedLengthStream::wrap(response.stream()?, length);
-        let bucket = self.env.bucket(STATE_BUCKET)?;
-        bucket.put(self.state_key(), stream).execute().await?;
-        self.update(|session| session.has_state = true);
+        let bucket: Bucket = self.env.bucket(STATE_BUCKET)?;
+        // Later than what it follows even if the clock stood still or went back.
+        let at_ms = now_ms().max(parent.unwrap_or(0) + 1);
+        let key = checkpoint_key(&name, &conversation, at_ms);
+        bucket.put(key, stream).execute().await?;
+        let checkpoint = Checkpoint {
+            at_ms,
+            parent,
+            text: turn.text.clone(),
+        };
+        self.store.put_checkpoint(&conversation, &checkpoint)?;
+        self.update(|session| {
+            session.has_state = true;
+            session.checkpoint = at_ms;
+        });
+
+        // The conversation is saved; tidying up after it is not worth failing over.
+        let mut unkept = self.prune(&name, &conversation).unwrap_or_else(|error| {
+            console_error!("dropping old checkpoints failed: {error}");
+            Vec::new()
+        });
+        if parent.is_none() {
+            unkept.push(legacy_state_key(&name));
+        }
+        self.discard(unkept).await;
         Ok(())
     }
 

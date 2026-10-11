@@ -34,6 +34,16 @@ Telegram ──webhook──▶ Worker
 4. A tool call that the policy does not pre-approve reaches the runner's `permission_prompt` MCP tool (`--permission-prompt-tool`). It becomes a Telegram message with **Allow / Always / Deny** buttons; Claude waits for the answer. `AskUserQuestion` arrives the same way and is shown as option buttons.
 5. When the turn ends, the answer is sent, files written to `/work/out/` are delivered as documents, and the state is saved to R2. The container is stopped after `IDLE_TTL_SECS`.
 
+### Conversations and going back
+
+The state saved after each turn is a checkpoint of its own: the transcript and `/work` as they were then, at `sessions/<chat>/<conversation>/<time>.tar.gz`. That is what the bot's three commands for conversations work on.
+
+- `/rewind` lists your recent messages. Picking one puts the conversation and the files back to how they were before you sent it; that turn and the later ones are forgotten and their archives deleted.
+- `/new` starts an empty conversation and keeps the one you leave.
+- `/resume` lists the kept conversations, and picking one continues it where it was left.
+
+All three replace the container, so the next message starts one from the checkpoint. A chat keeps its 10 most recently used conversations and each conversation its 10 newest checkpoints, which is 9 turns that can be undone (`CONVERSATIONS_KEPT` and `CHECKPOINTS_KEPT` in `session.rs`); older ones are deleted from R2. Nothing deletes a conversation on request.
+
 An alarm re-checks every 30 seconds while a turn is open, so an evicted Durable Object or a crashed container is picked up and the turn is run again. A new container is given the saved state before it runs anything; if that fails the turn is refused rather than run on an empty disk, and the saved copy is left as it is.
 
 ## Develop
@@ -66,7 +76,7 @@ npx wrangler dev --enable-containers=false \
   --var LLM_API_KEY:… --var SESSION_TOKEN_SECRET:…
 ```
 
-`DEV_RUNNER_URL` is for development only: all chats share that one runner. `TELEGRAM_API_BASE` redirects Bot API calls, for a mock or a self-hosted Bot API server.
+`DEV_RUNNER_URL` is for development only: all chats share that one runner, and nothing replaces it. `/new`, `/resume` and `/rewind` only take effect on it once you restart it with an empty working directory and `AGENT_CLAUDE_SESSION_ID` set to the conversation's id. `TELEGRAM_API_BASE` redirects Bot API calls, for a mock or a self-hosted Bot API server.
 
 The MCP container can be stood in for the same way. Start what runs inside it, then add `--var DEV_MCP_URL:http://127.0.0.1:8090` to the `wrangler dev` command:
 
@@ -142,7 +152,7 @@ Files over 20 MB are refused (`MCP_FILE_MAX_BYTES` in the agent image's environm
 
 `containers/agent/managed-settings.json` is the permission policy and `crates/runner/src/config.rs` (`DEFAULT_TOOLS`) the list of built-in tools. As shipped: files under `/work` can be edited freely, and the `domain` MCP server, `md2pdf` and `mcp-file` are pre-approved. Reading needs no approval anywhere in the container (`Read(//**)`), with the Read tool or a read-only shell command such as `ls`, `head` or `wc`; without that rule Claude Code asks about every read outside `/work`, which includes the files a skill brings with it. Every other shell command needs a button press, `python3` included. Web access, subagents, background tasks and scheduling are off, and so are the skills that ship with Claude Code (`containers/agent/settings.json`): the agent sees only the ones in `skills/`.
 
-A prompt can be answered with **Always**. For a shell command that covers the identical command only; for any other tool it covers every later use of that tool, and the button says which. The session keeps these answers, so they last until `/new` even though the container is replaced after every idle period.
+A prompt can be answered with **Always**. For a shell command that covers the identical command only; for any other tool it covers every later use of that tool, and the button says which. The session keeps these answers, so they last until `/new` or `/resume` even though the container is replaced after every idle period.
 
 ### PDFs
 
