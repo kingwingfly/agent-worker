@@ -1,0 +1,78 @@
+#!/bin/sh
+# mcp-file: copy a file the shared MCP server saved onto this machine.
+#
+#   mcp-file get PATH        writes /work/in/NAME, for the agent to read or use
+#   mcp-file deliver PATH    writes /work/out/NAME, which is sent to the user
+#
+# PATH is the path an MCP tool reported for a file it saved, and NAME is its last part.
+# The MCP server and the agent do not share a disk, so that path means nothing here.
+# This fetches the file from the file server beside the MCP server, through the Worker
+# and with the session's own token, and prints where it is, which leaves the agent
+# nothing to work out.
+set -eu
+
+limit="${MCP_FILE_MAX_BYTES:-20971520}"
+
+fail() {
+  echo "mcp-file: $*" >&2
+  exit 1
+}
+
+case ${1:-} in
+  get) dir="${MCP_FILE_IN_DIR:-/work/in}" ;;
+  deliver) dir="${MCP_FILE_OUT_DIR:-/work/out}" ;;
+  *) set -- ;;
+esac
+if [ "$#" -lt 2 ]; then
+  echo "usage: mcp-file get PATH | mcp-file deliver PATH" >&2
+  exit 2
+fi
+verb=$1
+shift
+# A path with spaces in it that was not quoted arrives as several words.
+path="$*"
+name=${path##*/}
+case $name in
+  "" | . | ..) fail "not the path of a file: $path" ;;
+esac
+if [ -z "${AGENT_WORKER_ORIGIN:-}" ] || [ -z "${AGENT_SESSION_TOKEN:-}" ]; then
+  fail "this agent is not connected to an MCP server"
+fi
+
+# Downloaded elsewhere and moved into place, so a transfer that is cut short leaves
+# nothing behind in a directory that is saved or sent.
+tmp=$(mktemp)
+trap 'rm -f "$tmp"' EXIT
+trap 'exit 130' HUP INT TERM
+
+# The token goes in on stdin, so it does not show up in the process list.
+code=0
+status=$(curl --silent --show-error --max-time 300 --max-filesize "$limit" \
+  --output "$tmp" --write-out '%{http_code}' \
+  --get --data-urlencode "path=$path" --config - <<CONFIG
+url = "$AGENT_WORKER_ORIGIN/file"
+header = "Authorization: Bearer $AGENT_SESSION_TOKEN"
+CONFIG
+) || code=$?
+
+megabytes=$((limit / 1048576))
+case $code in
+  0) ;;
+  63) fail "$name is larger than $megabytes MB" ;;
+  *) fail "the MCP server could not be reached (curl exit $code)" ;;
+esac
+case $status in
+  200) ;;
+  404) fail "the MCP server has no file at $path; save it there again, then retry" ;;
+  *) fail "the MCP server answered $status" ;;
+esac
+# A response sent without a length can only be measured once it has arrived.
+size=$(wc -c < "$tmp" | tr -d ' ')
+[ "$size" -le "$limit" ] || fail "$name is larger than $megabytes MB"
+
+mkdir -p "$dir"
+mv "$tmp" "$dir/$name"
+case $verb in
+  get) echo "saved $dir/$name ($size bytes)" ;;
+  deliver) echo "saved $dir/$name ($size bytes); the user receives it when you finish" ;;
+esac

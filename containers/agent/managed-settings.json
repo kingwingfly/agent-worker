@@ -3,7 +3,8 @@
     "allow": [
       "Skill",
       "mcp__domain",
-      "Bash(md2pdf *)"
+      "Bash(md2pdf *)",
+      "Bash(mcp-file *)"
     ],
     "disableBypassPermissionsMode": "disable"
   },

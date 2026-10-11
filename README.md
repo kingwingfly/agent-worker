@@ -7,10 +7,12 @@ Telegram ──webhook──▶ Worker
                         ├─ /tg/webhook ─▶ SessionDO (one per chat) ──WebSocket──▶ agent container
                         │                   SQLite: session, open prompts,          runner
                         │                   usage. R2: state, output files            └─ claude -p
-                        ├─ /llm/*  ◀───── model calls, with a session token ───────────────┘  │
+                        ├─ /llm/*  ◀───── model calls, with a session token ───────────────┘   │
                         │     └─▶ your LLM gateway (real key added here)                       │
-                        └─ /mcp    ◀───── MCP calls, with a session token ─────────────────────┘
+                        └─ /mcp, /file ◀─ MCP calls and file downloads, with a session token ──┘
                               └─▶ McpHostDO ──▶ MCP container (shared by all chats)
+                                                  mcp-front ─┬─▶ the MCP server
+                                                             └─▶ a file server
 ```
 
 | Path | What it is |
@@ -18,9 +20,10 @@ Telegram ──webhook──▶ Worker
 | `crates/proto` | Types shared by both sides: WebSocket frames, session tokens |
 | `crates/runner` | Runs in the agent container. Launches `claude`, relays its output, turns permission prompts into remote requests, packs up state |
 | `crates/gateway` | The Worker: Telegram webhook, `/llm` and `/mcp` proxies, `SessionDO`, `McpHostDO` |
+| `crates/mcp-front` | Runs in the MCP container, in front of the MCP server: starts it, serves the files it saves, and routes requests between the two |
 | `crates/mcp-example` | Placeholder MCP server so the stack deploys before yours is wired in |
-| `containers/agent` | Agent image: runner, pinned Claude Code, `md2pdf`, permission policy, system prompt |
-| `containers/mcp` | MCP image. Builds the placeholder; point it at your server |
+| `containers/agent` | Agent image: runner, pinned Claude Code, `md2pdf`, `mcp-file`, permission policy, system prompt |
+| `containers/mcp` | MCP image: `mcp-front` and the placeholder; point it at your server |
 | `skills/` | Skills baked into the agent image |
 
 ## How a message is handled
@@ -65,6 +68,14 @@ npx wrangler dev --enable-containers=false \
 
 `DEV_RUNNER_URL` is for development only: all chats share that one runner. `TELEGRAM_API_BASE` redirects Bot API calls, for a mock or a self-hosted Bot API server.
 
+The MCP container can be stood in for the same way. Start what runs inside it, then add `--var DEV_MCP_URL:http://127.0.0.1:8090` to the `wrangler dev` command:
+
+```sh
+cargo build -p agent-mcp-example
+MCP_FRONT_LISTEN=127.0.0.1:8090 MCP_FRONT_FILES_DIR=/tmp/agent/files \
+  cargo run -p agent-mcp-front -- target/debug/agent-mcp-example
+```
+
 ## Deploy
 
 Needs a Workers Paid plan, Docker or podman for building the images, and `cargo install worker-build`.
@@ -95,13 +106,41 @@ It must expose the Anthropic Messages format: `POST /v1/messages` with unbuffere
 
 ### Your MCP server
 
-Replace `containers/mcp/Dockerfile` with a build of your server, or set `image` in `wrangler.toml` to a registry image. It must listen on `0.0.0.0:8080` and serve streamable HTTP at `/mcp`. Requests arrive with `Host: localhost:8080` and an `x-agent-session` header naming the chat, set by the Worker from the verified token.
+The MCP container's entry point is `mcp-front`, not the MCP server. It starts the server given as its command line, and is the only thing listening on the container's open port, `0.0.0.0:8080`. Behind it, on loopback:
+
+| | Default | Reached by |
+|---|---|---|
+| your MCP server | `127.0.0.1:8081` (`MCP_FRONT_MCP_ADDR`) | every request except `/file` |
+| the file server | `127.0.0.1:8082` (`MCP_FRONT_FILES_ADDR`) | `/file` |
+
+To run your own server, put its binary in the image built by `containers/mcp/Dockerfile` and name it as the command after `mcp-front`. It must serve streamable HTTP at `/mcp` on the loopback address above; `mcp-front` sets `MCP_FRONT_MCP_ADDR` in its environment for servers that can read it. Requests arrive with `Host: localhost:8080` and an `x-agent-session` header naming the chat, set by the Worker from the verified token.
+
+The port opens only once the MCP server accepts connections, and if the MCP server exits so does `mcp-front`, which stops the container.
 
 The container's disk and memory are lost when it stops (`MCP_IDLE_TTL_SECS` after the last request). If your server's shared state cannot be rebuilt, persist it elsewhere or keep the container up.
 
+#### Files
+
+The MCP container and the agent containers do not share a disk, so the path of a file your server saved means nothing to an agent as it is. The file server turns that path into a download. A tool that makes a file has to do two things: save it under `MCP_FRONT_FILES_DIR` (also set in the server's environment), and return its path.
+
+```
+GET /file?path=<the path the tool returned>
+```
+
+Only regular files inside that directory are served, wherever symlinks or `..` in the path lead; everything else is a 404. The Worker forwards `/file` like `/mcp`, after checking the session token. Every chat can fetch every file in the directory.
+
+The agent does not build that request itself. Its image has `mcp-file`, pre-approved like `md2pdf`, and `skills/mcp-files` tells it when to use it:
+
+```sh
+mcp-file get '<path>'       # /work/in/<file name>, for the agent to read or use
+mcp-file deliver '<path>'   # /work/out/<file name>, which is sent to the user
+```
+
+Files over 20 MB are refused (`MCP_FILE_MAX_BYTES` in the agent image's environment), because everything under `/work` is saved with the conversation after each turn. Only fetching exists: there is no way yet for an agent to hand a file to the MCP server.
+
 ### What the agent may do
 
-`containers/agent/managed-settings.json` is the permission policy and `crates/runner/src/config.rs` (`DEFAULT_TOOLS`) the list of built-in tools. As shipped: files under `/work` can be read and edited freely, the `domain` MCP server and `md2pdf` are pre-approved, read-only shell commands run without asking, and every other shell command needs a button press. Web access, subagents, background tasks and scheduling are off.
+`containers/agent/managed-settings.json` is the permission policy and `crates/runner/src/config.rs` (`DEFAULT_TOOLS`) the list of built-in tools. As shipped: files under `/work` can be read and edited freely, the `domain` MCP server, `md2pdf` and `mcp-file` are pre-approved, read-only shell commands run without asking, and every other shell command needs a button press. Web access, subagents, background tasks and scheduling are off.
 
 A prompt can be answered with **Always**. For a shell command that covers the identical command only; for any other tool it covers every later use of that tool, and the button says which. The session keeps these answers, so they last until `/new` even though the container is replaced after every idle period.
 
@@ -147,4 +186,5 @@ The runner relies on `--permission-prompt-tool`, `--input-format stream-json`, `
 
 - Web UI (Leptos) on the same session API.
 - Locking containers down to the Worker only (`enableInternet: false` with outbound interception).
+- Sending a file from an agent to the MCP server. Files only travel the other way.
 - Letting a container sleep while a prompt waits (`defer`), and filesystem snapshots instead of the tar archive.
