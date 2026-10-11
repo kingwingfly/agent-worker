@@ -104,6 +104,10 @@ struct Turn {
     /// The message that shows the turn's progress. It is edited as the turn goes on and
     /// stays in the chat when it is over.
     status_message_id: Option<i64>,
+    /// Something was sent below the progress message since it was last shown, so it has
+    /// scrolled up the chat.
+    #[serde(default)]
+    status_buried: bool,
     /// The message has been handed to the runner, so stopping means interrupting it.
     #[serde(default)]
     delivered: bool,
@@ -325,6 +329,7 @@ impl Inner {
         let cfg = self.cfg()?;
         let bot = Bot::new(&cfg);
         if let Some(message) = update.message {
+            self.bury_status();
             if self.session.borrow().name.is_empty() {
                 self.update(|session| {
                     session.name = name.to_owned();
@@ -386,6 +391,7 @@ impl Inner {
                 text: text.to_owned(),
                 started_at_ms: now_ms(),
                 status_message_id: None,
+                status_buried: false,
                 delivered: false,
                 stop_requested: false,
                 failures: 0,
@@ -869,30 +875,82 @@ impl Inner {
 
     /// Updates the progress message, at most once per interval.
     async fn show_status(&self) {
-        let Some(message_id) = self.turn().and_then(|turn| turn.status_message_id) else {
-            return;
-        };
         let now = now_ms();
-        let html = {
+        {
             let mut live = self.live.borrow_mut();
             if now.saturating_sub(live.last_status_edit_ms) < STATUS_EDIT_INTERVAL_MS {
                 return;
             }
             live.last_status_edit_ms = now;
-            live.status.render(render::WORKING)
-        };
-        if let Ok(cfg) = self.cfg() {
-            let bot = Bot::new(&cfg);
-            let _ = bot
-                .edit_message(self.chat_id(), message_id, &html, None)
-                .await;
         }
+        self.redraw_status().await;
+    }
+
+    /// Notes that a message now sits below the turn's progress message.
+    fn bury_status(&self) {
+        if self.turn().is_some_and(|turn| !turn.status_buried) {
+            self.update(|session| {
+                if let Some(turn) = &mut session.turn {
+                    turn.status_buried = true;
+                }
+            });
+        }
+    }
+
+    /// Shows the turn's progress as it stands. A progress message that prompts, or the
+    /// user's own messages, have pushed up the chat is replaced by a new one below them,
+    /// so that the newest message is always the one that is changing. That waits while a
+    /// prompt is open: until it is answered, the prompt is what should be read first.
+    async fn redraw_status(&self) {
+        let Some(turn) = self.turn() else { return };
+        let (Some(message_id), Ok(cfg)) = (turn.status_message_id, self.cfg()) else {
+            return;
+        };
+        let bot = Bot::new(&cfg);
+        let chat_id = self.chat_id();
+        let html = self.live.borrow().status.render(render::WORKING);
+        let prompt_is_open = self.store.approvals().is_ok_and(|open| !open.is_empty());
+        if !turn.status_buried || prompt_is_open {
+            let _ = bot.edit_message(chat_id, message_id, &html, None).await;
+            return;
+        }
+
+        // Cleared before the first await, so that two events cannot both move it.
+        let set_buried = |buried| {
+            self.update(|session| {
+                if let Some(open) = &mut session.turn {
+                    open.status_buried = buried;
+                }
+            });
+        };
+        set_buried(false);
+        let Ok(moved) = bot.send_message(chat_id, &html, None).await else {
+            return set_buried(true);
+        };
+        // The turn may have been closed while that was on its way. Its progress message
+        // then has its last form already, and the new one is the one to remove.
+        let adopted = self.update(|session| match &mut session.turn {
+            Some(open) if open.id == turn.id && open.status_message_id == Some(message_id) => {
+                open.status_message_id = Some(moved);
+                true
+            }
+            _ => false,
+        });
+        let left_over = if adopted { message_id } else { moved };
+        let _ = bot.delete_message(chat_id, left_over).await;
     }
 
     /// Gives the progress message its last form when a turn is over. It stays in the chat
     /// as the record of what was done; one that never got past "Working…" is removed.
+    /// Nothing touches the message after this.
     async fn close_status(&self, bot: &Bot, turn: &Turn, heading: &str) {
-        let Some(message_id) = turn.status_message_id else {
+        // Read from the open turn where there still is one: `turn` may be a copy made
+        // before the message was last moved.
+        let message_id = self.update(|session| match &mut session.turn {
+            Some(open) if open.id == turn.id => open.status_message_id.take(),
+            _ => turn.status_message_id,
+        });
+        let Some(message_id) = message_id else {
             return;
         };
         let html = {
@@ -939,6 +997,7 @@ impl Inner {
         let message_id = bot
             .send_message(self.chat_id(), &html, Some(&keyboard))
             .await?;
+        self.bury_status();
         self.store.put_approval(&Approval {
             request_id,
             turn_id,
@@ -1043,8 +1102,12 @@ impl Inner {
         }
         let (prompt, _) = self.prompt_of(&approval);
         let html = format!("{prompt}\n\n{outcome}");
-        bot.edit_message(chat_id, approval.message_id, &html, None)
-            .await
+        let edited = bot
+            .edit_message(chat_id, approval.message_id, &html, None)
+            .await;
+        // With the prompt answered, the progress is what to watch again.
+        self.redraw_status().await;
+        edited
     }
 
     /// Gets a decision to the runner, reconnecting first if this object was evicted
