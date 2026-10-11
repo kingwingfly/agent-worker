@@ -2,6 +2,9 @@
 //! to the shared MCP container. All accept only a valid session token and replace it with
 //! the real upstream credential or identity, so no upstream secret ever enters a container.
 //! Nor does anything that says which gateway it is: see [`scrub`].
+//!
+//! A valid token is not enough by itself, because the agent can read its own: see
+//! [`calls`] for what else a request has to be.
 
 use agent_proto::{
     Usage,
@@ -16,12 +19,13 @@ use worker::{
 };
 
 use crate::{
+    calls::{self, Admission, Refusal},
     config::{Config, LlmAuth},
     mcp_host::{MCP_BINDING, MCP_INSTANCE},
     metering::{SseUsage, json_usage},
-    platform::now_ms,
+    platform::{error, now_ms},
     scrub::{self, SseScrub},
-    session::{SESSION_BINDING, USAGE_PATH},
+    session::{ADMIT_PATH, SESSION_BINDING, USAGE_PATH},
 };
 
 /// Header telling the MCP server which session a call belongs to. Set here from the
@@ -40,13 +44,54 @@ fn authenticate(request: &Request, cfg: &Config) -> Result<Option<Claims>> {
     }))
 }
 
-/// A 401 in the shape of an Anthropic API error, which Claude Code reports cleanly.
+/// What a chat is told when a model call is refused for the day's budget. Claude Code
+/// prints it into the turn's result, which is how it reaches the chat.
+const OVER_BUDGET: &str = "Today's usage limit for this chat is used up.";
+
+/// A refusal of this Worker's own, in the shape of an Anthropic API error, which Claude
+/// Code reports cleanly.
+fn refused(status: u16, kind: &str, message: &str) -> Result<Response> {
+    let body = json!({ "type": "error", "error": { "type": kind, "message": message } });
+    Ok(Response::from_json(&body)?.with_status(status))
+}
+
 fn unauthorized() -> Result<Response> {
-    let body = json!({
-        "type": "error",
-        "error": { "type": "authentication_error", "message": "invalid or expired session token" },
-    });
-    Ok(Response::from_json(&body)?.with_status(401))
+    refused(
+        401,
+        "authentication_error",
+        "invalid or expired session token",
+    )
+}
+
+/// Asks the chat's session whether the token is still its container's and, for a model
+/// call, whether today's budget allows another. Returns the answer to give in place of
+/// going on, if the session refuses.
+///
+/// A session that cannot be asked is an error, not a yes: the caller answers with a
+/// failure that Claude Code tries again.
+async fn turned_away(env: &Env, claims: &Claims, spends: bool) -> Result<Option<Response>> {
+    let asked = Admission {
+        expires_at: claims.expires_at,
+        spends,
+    };
+    let mut init = RequestInit::new();
+    init.with_method(Method::Post)
+        .with_body(Some(JsValue::from_str(&serde_json::to_string(&asked)?)));
+    let question = Request::new_with_init(&format!("https://session{ADMIT_PATH}"), &init)?;
+    let answer = env
+        .durable_object(SESSION_BINDING)?
+        .get_by_name(&claims.session)?
+        .fetch_with_request(question)
+        .await?;
+    let status = answer.status_code();
+    match Refusal::from_status(status) {
+        Some(Refusal::Stale) => unauthorized().map(Some),
+        Some(Refusal::OverBudget) => refused(402, "billing_error", OVER_BUDGET).map(Some),
+        None if status == 200 => Ok(None),
+        None => Err(error(format!(
+            "the session answered {status} when asked about a token"
+        ))),
+    }
 }
 
 /// Copies the request headers minus credentials and everything describing the hop from
@@ -73,16 +118,21 @@ fn forwarded_headers(request: &Request) -> Result<Headers> {
     Ok(headers)
 }
 
+/// A request for `target` with a body that has been read already.
+fn rebuilt(method: Method, target: &str, headers: Headers, body: &[u8]) -> Result<Request> {
+    let mut init = RequestInit::new();
+    init.with_method(method).with_headers(headers);
+    if !body.is_empty() {
+        init.with_body(Some(JsValue::from(Uint8Array::from(body))));
+    }
+    Request::new_with_init(target, &init)
+}
+
 /// Rebuilds the request for `target`. The body is buffered: these are JSON requests, and
 /// a buffered body can be sent anywhere without the caveats of a streamed one.
 async fn retarget(mut request: Request, target: &str, headers: Headers) -> Result<Request> {
     let body = request.bytes().await?;
-    let mut init = RequestInit::new();
-    init.with_method(request.method()).with_headers(headers);
-    if !body.is_empty() {
-        init.with_body(Some(JsValue::from(Uint8Array::from(body.as_slice()))));
-    }
-    Request::new_with_init(target, &init)
+    rebuilt(request.method(), target, headers, &body)
 }
 
 /// How much of what the gateway said goes into one line of the log.
@@ -147,8 +197,12 @@ fn scrubbed(body: ByteStream, session: String) -> impl Stream<Item = Result<Vec<
     })
 }
 
-/// `ANY /llm/<path>` → `<LLM_BASE_URL>/<path>`. The response, usually an event stream, is
-/// passed back as it arrives, and a copy of it is read for the tokens it reports.
+/// `POST /llm/v1/messages[/count_tokens]` → the same path under `LLM_BASE_URL`. The
+/// response, usually an event stream, is passed back as it arrives, and a copy of it is
+/// read for the tokens it reports.
+///
+/// Nothing else is passed on, and nothing for a model other than the deployment's or
+/// past the chat's budget; see [`calls`].
 ///
 /// An error is not passed back as it arrives, whichever way the gateway reports it: with
 /// a status, inside the stream, or as a success that is none. The container gets one of
@@ -158,18 +212,22 @@ pub async fn llm(request: Request, env: &Env, ctx: &Context, cfg: &Config) -> Re
         return unauthorized();
     };
     let session = &claims.session;
-    forward(request, env, ctx, cfg, session)
-        .await
-        .or_else(|error| {
-            // Not returned as it is: the runtime's own errors can quote the address that
-            // was being called.
-            console_error!("{session}: a model call failed in the Worker: {error}");
-            failure(502, b"", Headers::new())
-        })
+    let answered = async {
+        match turned_away(env, &claims, true).await? {
+            Some(refusal) => Ok(refusal),
+            None => forward(request, env, ctx, cfg, session).await,
+        }
+    };
+    answered.await.or_else(|error| {
+        // Not returned as it is: the runtime's own errors can quote the address that
+        // was being called.
+        console_error!("{session}: a model call failed in the Worker: {error}");
+        failure(502, b"", Headers::new())
+    })
 }
 
 async fn forward(
-    request: Request,
+    mut request: Request,
     env: &Env,
     ctx: &Context,
     cfg: &Config,
@@ -177,6 +235,22 @@ async fn forward(
 ) -> Result<Response> {
     let url = request.url()?;
     let path = url.path().strip_prefix("/llm").unwrap_or_default();
+    let method = request.method();
+    // Both refusals are logged: a version of Claude Code that came to need another
+    // address or model would otherwise fail without a trace of why.
+    if !calls::is_model_call(method.as_ref(), path) {
+        console_error!("{session}: refused {method} {path}, which is not a model call");
+        return refused(404, "not_found_error", "There is nothing at this address.");
+    }
+    let body = request.bytes().await?;
+    if !calls::names_a_configured_model(&body, cfg.model.as_deref(), cfg.small_model.as_deref()) {
+        let named = calls::named_model(&body).unwrap_or_default();
+        let named = excerpt(named.as_bytes());
+        console_error!(
+            "{session}: refused a call for the model {named:?}, which is not configured"
+        );
+        return refused(403, "permission_error", "This model is not available here.");
+    }
     let query = url
         .query()
         .map(|query| format!("?{query}"))
@@ -188,7 +262,7 @@ async fn forward(
         LlmAuth::Bearer => headers.set("authorization", &format!("Bearer {}", cfg.llm_api_key))?,
         LlmAuth::ApiKey => headers.set("x-api-key", &cfg.llm_api_key)?,
     }
-    let mut response = Fetch::Request(retarget(request, &target, headers).await?)
+    let mut response = Fetch::Request(rebuilt(method, &target, headers, &body)?)
         .send()
         .await?;
     let status = response.status_code();
@@ -273,6 +347,11 @@ pub async fn mcp(request: Request, env: &Env, cfg: &Config) -> Result<Response> 
     let Some(claims) = authenticate(&request, cfg)? else {
         return unauthorized();
     };
+    // The MCP server acts in the chat's name, which a token that has left its container
+    // must not be able to borrow.
+    if let Some(refusal) = turned_away(env, &claims, false).await? {
+        return Ok(refusal);
+    }
     let url = request.url()?;
     let query = url
         .query()
