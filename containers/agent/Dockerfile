@@ -51,11 +51,12 @@ COPY containers/agent/md2pdf/md2pdf /usr/local/bin/md2pdf
 COPY containers/agent/mcp-file /usr/local/bin/mcp-file
 COPY containers/agent/md2pdf/defaults.yaml containers/agent/md2pdf/header.typ \
      containers/agent/md2pdf/tidy.lua /etc/agent/md2pdf/
-# The agent's like everything else in its working directory. All of that directory is
-# read as the agent to save it after a turn, so one file there that it could not read
-# would stop every save.
-COPY --chown=agent:agent containers/agent/CLAUDE_agent.md /work/CLAUDE.md
 COPY --chown=agent:agent skills/ /home/agent/.claude/skills/
+# Standing instructions for the agent. They go into Claude Code's own directory and not
+# into /work: the runner starts it with `--setting-sources user`, under which a CLAUDE.md
+# in the working directory is not loaded. /work is also saved and restored with each
+# conversation, so a copy there would stay as it was when the conversation began.
+COPY --chown=agent:agent containers/agent/CLAUDE_agent.md /home/agent/.claude/CLAUDE.md
 # Claude keeps its transcripts and settings here, so it has to own all of it whichever
 # way the builder created the directories above.
 #
@@ -65,7 +66,8 @@ COPY --chown=agent:agent skills/ /home/agent/.claude/skills/
 # be, arrived closed to the agent, which is not root. Claude Code does not start
 # without a prompt file or a settings file it was told to read.
 RUN chown -R agent:agent /home/agent/.claude \
- && chmod -R u=rwX,go=rX /etc/claude-code /etc/agent /home/agent/.claude/skills /work/CLAUDE.md \
+ && chmod -R u=rwX,go=rX /etc/claude-code /etc/agent \
+      /home/agent/.claude/skills /home/agent/.claude/CLAUDE.md \
  && chmod 755 /usr/local/bin/md2pdf /usr/local/bin/mcp-file
 
 USER agent
