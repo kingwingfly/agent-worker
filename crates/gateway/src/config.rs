@@ -83,10 +83,33 @@ fn required(env: &Env, name: &str) -> Result<String> {
     var(env, name).ok_or_else(|| error(format!("variable {name} is not set")))
 }
 
+/// The shortest key session tokens may be signed with. Whoever holds a token can try
+/// keys against its signature for as long as they like, so a short one would let them
+/// sign tokens for other chats.
+const MIN_TOKEN_SECRET_CHARS: usize = 16;
+
+/// A secret that is set and not empty. An empty one is worse than none: an empty
+/// webhook secret is what a request without the header presents.
 fn secret(env: &Env, name: &str) -> Result<String> {
-    env.secret(name)
+    let value = env
+        .secret(name)
         .map(|secret| secret.to_string())
-        .map_err(|_| error(format!("secret {name} is not set")))
+        .map_err(|_| error(format!("secret {name} is not set")))?;
+    if value.trim().is_empty() {
+        return Err(error(format!("secret {name} is empty")));
+    }
+    Ok(value)
+}
+
+fn token_secret(env: &Env) -> Result<String> {
+    let name = "SESSION_TOKEN_SECRET";
+    let value = secret(env, name)?;
+    if value.len() < MIN_TOKEN_SECRET_CHARS {
+        return Err(error(format!(
+            "secret {name} must be at least {MIN_TOKEN_SECRET_CHARS} characters long"
+        )));
+    }
+    Ok(value)
 }
 
 fn seconds(env: &Env, name: &str, default: u64) -> Result<u64> {
@@ -112,7 +135,7 @@ impl Config {
                 .to_owned(),
             bot_token: secret(env, "TELEGRAM_BOT_TOKEN")?,
             webhook_secret: secret(env, "TELEGRAM_WEBHOOK_SECRET")?,
-            token_secret: secret(env, "SESSION_TOKEN_SECRET")?,
+            token_secret: token_secret(env)?,
             llm_base_url: required(env, "LLM_BASE_URL")?
                 .trim_end_matches('/')
                 .to_owned(),
