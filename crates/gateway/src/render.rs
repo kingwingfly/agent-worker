@@ -19,6 +19,8 @@ const MESSAGE_BUDGET: usize = 3900;
 const STATUS_TEXT_TAIL: usize = 1200;
 const STATUS_TOOL_LINES: usize = 6;
 const PROMPT_INPUT_LIMIT: usize = 1500;
+/// The name of the file a request too long for its prompt is sent in.
+pub const REQUEST_FILE: &str = "request.txt";
 /// How much of a message a button of the `/resume` or `/rewind` list shows.
 const PICK_LABEL_CHARS: usize = 36;
 /// How much of a message is quoted back once it has been picked.
@@ -483,20 +485,66 @@ fn button(text: &str, callback: Callback) -> Value {
     json!({ "text": text, "callback_data": callback.encode() })
 }
 
+/// A tool's input as JSON, with the fields that take least room first. What a call is
+/// aimed at, a path or an address, is short, and what it carries there can be any
+/// length. In the order of their names a file's content would come before its path and,
+/// in a prompt that has to be cut, push it out of sight.
+fn shortest_first(input: &Value) -> String {
+    let pretty = |value: &Value| serde_json::to_string_pretty(value).unwrap_or_default();
+    let Some(fields) = input.as_object().filter(|fields| !fields.is_empty()) else {
+        return pretty(input);
+    };
+    let mut fields: Vec<(String, String)> = fields
+        .iter()
+        // A string's line breaks are escaped in JSON, so every break here is one of
+        // the layout's and takes the indentation of the field it is in.
+        .map(|(name, value)| (pretty(&json!(name)), pretty(value).replace('\n', "\n  ")))
+        .collect();
+    // Stable, so fields of one length stay in the order of their names.
+    fields.sort_by_key(|(_, value)| value.len());
+    let lines: Vec<String> = fields
+        .iter()
+        .map(|(name, value)| format!("  {name}: {value}"))
+        .collect();
+    format!("{{\n{}\n}}", lines.join(",\n"))
+}
+
+/// What a permission prompt says is being asked for: the command for the shell, and the
+/// whole input for any other tool.
+fn requested(tool_name: &str, input: &Value) -> String {
+    match (tool_name, input["command"].as_str()) {
+        ("Bash", Some(command)) => command.to_owned(),
+        _ => shortest_first(input),
+    }
+}
+
+/// The whole of a request that its prompt can only show the start of, or `None` if the
+/// prompt shows all of it. An answer covers everything that was asked for, so the part
+/// that does not fit has to reach the user some other way: as a file, sent ahead of the
+/// prompt and named [`REQUEST_FILE`].
+pub fn permission_overflow(tool_name: &str, input: &Value) -> Option<String> {
+    let whole = requested(tool_name, input);
+    (whole.chars().count() > PROMPT_INPUT_LIMIT).then_some(whole)
+}
+
 /// Message and buttons asking whether a tool call may run.
 pub fn permission_prompt(request_id: &str, tool_name: &str, input: &Value) -> (String, Value) {
     let mut html = format!(
         "🔐 <b>Permission needed</b>\n{}",
         escape(&tool_summary(tool_name, &Value::Null))
     );
-    let body = match (tool_name, input["command"].as_str()) {
-        ("Bash", Some(command)) => command.to_owned(),
-        _ => serde_json::to_string_pretty(input).unwrap_or_default(),
-    };
+    let body = requested(tool_name, input);
     html.push_str(&format!(
         "\n<pre>{}</pre>",
         escape(&truncate(&body, PROMPT_INPUT_LIMIT))
     ));
+    let total = body.chars().count();
+    if total > PROMPT_INPUT_LIMIT {
+        html.push_str(&format!(
+            "\n✂️ <b>This is only the start</b> of {total} characters. \
+             All of it is in <code>{REQUEST_FILE}</code> above."
+        ));
+    }
     if let Some(description) = input["description"].as_str() {
         html.push_str(&format!("\n<i>{}</i>", escape(description)));
     }
@@ -1149,6 +1197,49 @@ mod tests {
         );
         let (_, keyboard) = permission_prompt("id", agent_proto::ASK_USER_QUESTION, &json!({}));
         assert_eq!(buttons(&keyboard).len(), 2);
+    }
+
+    #[test]
+    fn a_prompt_shows_where_a_call_is_aimed_before_what_it_carries() {
+        let content = "line\n".repeat(1000);
+        let input = json!({ "content": content, "file_path": "/home/agent/notes.txt" });
+        let (html, _) = permission_prompt("id", "Write", &input);
+        let path = html
+            .find("/home/agent/notes.txt")
+            .expect("the path is shown");
+        assert!(path < html.find("\"content\"").expect("the content is begun"));
+
+        // Short inputs are still the JSON they always were, nested values included.
+        assert_eq!(
+            shortest_first(&json!({ "b": { "deep": [1, 2] }, "a": 1 })),
+            "{\n  \"a\": 1,\n  \"b\": {\n    \"deep\": [\n      1,\n      2\n    ]\n  }\n}"
+        );
+        assert_eq!(shortest_first(&json!({})), "{}");
+        assert_eq!(shortest_first(&json!("text")), "\"text\"");
+    }
+
+    #[test]
+    fn a_request_too_long_for_its_prompt_is_also_given_whole() {
+        let short = json!({ "command": "ls -l" });
+        assert_eq!(permission_overflow("Bash", &short), None);
+        assert!(
+            !permission_prompt("id", "Bash", &short)
+                .0
+                .contains("request.txt")
+        );
+
+        let command = format!("echo {}", "a".repeat(PROMPT_INPUT_LIMIT));
+        let long = json!({ "command": command });
+        assert_eq!(permission_overflow("Bash", &long), Some(command.clone()));
+        let (html, _) = permission_prompt("id", "Bash", &long);
+        assert!(html.contains("This is only the start</b> of 1505 characters"));
+        assert!(html.contains("<code>request.txt</code>"));
+        assert!(units(&html) < MESSAGE_BUDGET);
+
+        // Other tools are measured by what the prompt would show of them.
+        let input = json!({ "file_path": "/x", "content": "c".repeat(PROMPT_INPUT_LIMIT) });
+        let whole = permission_overflow("Write", &input).expect("too long to show");
+        assert_eq!(serde_json::from_str::<Value>(&whole).unwrap(), input);
     }
 
     #[test]

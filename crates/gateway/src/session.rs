@@ -1304,6 +1304,15 @@ impl Inner {
         if let Some(effort) = query.data.as_deref().and_then(render::picked_effort) {
             self.update(|session| session.effort = effort);
             return self
+        // An answer covers all of a request, so one too long for its prompt goes ahead
+        // of it as a file. If that cannot be sent the user is not asked, and the request
+        // is declined like any other that could not be shown.
+        if tool_name != ASK_USER_QUESTION
+            && let Some(whole) = render::permission_overflow(&tool_name, &input)
+        {
+            bot.send_document(self.chat_id(), render::REQUEST_FILE, whole.as_bytes())
+                .await?;
+        }
                 .close_list(bot, &query, &render::effort_set(effort))
                 .await;
         }
