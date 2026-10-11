@@ -507,6 +507,10 @@ impl Inner {
 
     /// Starts the shared MCP container, or keeps it up, without waiting for it.
     fn warm_mcp(&self) {
+        // One started by hand is up already.
+        if self.cfg().is_ok_and(|cfg| cfg.dev_mcp_url.is_some()) {
+            return;
+        }
         let Ok(namespace) = self.env.durable_object(MCP_BINDING) else {
             return;
         };

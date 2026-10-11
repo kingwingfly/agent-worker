@@ -1,0 +1,29 @@
+[package]
+name = "agent-mcp-front"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mcp-front"
+path = "src/main.rs"
+
+[dependencies]
+agent-proto.workspace = true
+serde.workspace = true
+anyhow = "1"
+async-trait = "0.1"
+axum = "0.8"
+pingora = { version = "0.9", features = ["proxy"] }
+tokio = { version = "1", features = ["rt", "macros", "process", "signal", "sync", "net", "fs"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["fs"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false }
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }

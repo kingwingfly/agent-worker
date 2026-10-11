@@ -6,8 +6,7 @@ publish.workspace = true
 license.workspace = true
 
 [dependencies]
-agent-proto.workspace = true
 serde.workspace = true
 axum = "0.8"
 rmcp = { version = "3", features = ["server", "macros", "transport-streamable-http-server"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs"] }

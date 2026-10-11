@@ -45,6 +45,7 @@ COPY --from=build /src/target/release/runner /usr/local/bin/runner
 COPY containers/agent/managed-settings.json /etc/claude-code/managed-settings.json
 COPY containers/agent/system.md /etc/agent/system.md
 COPY containers/agent/md2pdf/md2pdf /usr/local/bin/md2pdf
+COPY containers/agent/mcp-file /usr/local/bin/mcp-file
 COPY containers/agent/md2pdf/defaults.yaml containers/agent/md2pdf/header.typ \
      containers/agent/md2pdf/tidy.lua /etc/agent/md2pdf/
 COPY --chown=agent:agent skills/ /home/agent/.claude/skills/
@@ -57,6 +58,9 @@ USER agent
 RUN printf '# Check\n\n| a | b |\n|---|---|\n| 中文 | ok |\n' > /tmp/check.md \
  && md2pdf /tmp/check.md /tmp/check.pdf \
  && rm /tmp/check.md /tmp/check.pdf
+# The file helper has to be runnable, and to refuse what is not a file before it
+# contacts anything.
+RUN mcp-file get .. 2>/dev/null; [ "$?" -eq 1 ]
 ENV HOME=/home/agent \
     PATH=/home/agent/.local/bin:/usr/local/bin:/usr/bin:/bin \
     CLAUDE_CONFIG_DIR=/home/agent/.claude
