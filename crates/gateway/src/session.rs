@@ -39,7 +39,7 @@ use crate::{
     remember,
     render::{self, Callback, Pick, Status},
     store::{Approval, Checkpoint, Store},
-    update::{CallbackQuery, Message, StoppedGeneration, Update},
+    update::{self, CallbackQuery, Message, StoppedGeneration, Update},
 };
 
 pub const SESSION_BINDING: &str = "SESSION";
@@ -77,6 +77,13 @@ const TELEGRAM_FILE_LIMIT: u64 = 10 * 1024 * 1024;
 /// Pauses before each attempt at sending a message that must arrive.
 const DELIVERY_BACKOFF_MS: [u64; 3] = [0, 2_000, 8_000];
 const MS_PER_DAY: u64 = 86_400_000;
+/// How long Telegram is offered the last form of a guest's reply before it is given up.
+const UNSENT_KEPT_MS: u64 = 15 * 60_000;
+/// The pause before offering it again after a refusal that did not say how long to wait.
+const UNSENT_RETRY_MS: u64 = 15_000;
+/// How often it is offered while Telegram refuses it for another reason than too many
+/// calls, such as a reply that was deleted. Waiting does not mend that.
+const UNSENT_TRIES: u32 = 4;
 /// Checkpoints kept for a conversation. The oldest of them is only what the next one
 /// started from, so one turn fewer can be undone.
 const CHECKPOINTS_KEPT: usize = 10;
@@ -251,6 +258,24 @@ struct Session {
     /// conversation. `None` leaves it to the model's default.
     #[serde(default)]
     effort: Option<Effort>,
+    /// What guests' replies are to say in the end and Telegram has not taken yet. A
+    /// reply is all a guest's turn has, so its last form is kept until it is on show.
+    #[serde(default)]
+    unsent: Vec<Unsent>,
+}
+
+/// The last form of a guest's reply, on its way to Telegram.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Unsent {
+    /// The reply, by the id it is changed by.
+    reply: String,
+    html: String,
+    /// When the turn ended.
+    since_ms: u64,
+    /// It is not offered again before this.
+    retry_at_ms: u64,
+    /// How often Telegram has refused it.
+    tries: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -347,6 +372,9 @@ struct Live {
     draft_shown: bool,
     /// Telegram did not take a draft, so the turn goes on without them.
     drafts_off: bool,
+    /// Telegram asked for fewer calls until then. A guest's progress is left out for
+    /// that long, so that what the wait is over for is the answer.
+    quiet_until_ms: u64,
     unacked_events: u32,
     /// The chat is being moved to another conversation, or to another point in this one.
     switching: bool,
@@ -533,6 +561,19 @@ impl Inner {
     }
 
     async fn arm(&self, delay_ms: u64) {
+        // There is one alarm for everything. Whatever else it is set for, it comes
+        // back in time for a reply Telegram has still to take.
+        let unsent = self
+            .session
+            .borrow()
+            .unsent
+            .iter()
+            .map(|unsent| unsent.retry_at_ms)
+            .min();
+        let delay_ms = match unsent {
+            Some(at_ms) => delay_ms.min(at_ms.saturating_sub(now_ms())),
+            None => delay_ms,
+        };
         let storage = self.state.storage();
         if let Err(error) = storage.set_alarm(Duration::from_millis(delay_ms)).await {
             console_error!("setting the alarm failed: {error}");
@@ -1582,9 +1623,22 @@ impl Inner {
         };
         let (html, keyboard) = match self.guest_prompt() {
             Some((html, keyboard)) => (html, Some(keyboard)),
+            // Progress can wait while Telegram asks for fewer calls. A prompt cannot:
+            // the turn stands still until it is answered.
+            None if now_ms() < self.live.borrow().quiet_until_ms => return,
             None => (self.live.borrow().status.render(render::WORKING), None),
         };
-        let _ = bot.edit_guest_reply(reply, &html, keyboard.as_ref()).await;
+        if let Err(error) = bot.edit_guest_reply(reply, &html, keyboard.as_ref()).await {
+            self.keep_quiet(&error);
+        }
+    }
+
+    /// Notes for how long Telegram asked to be left alone, if that is why a call failed.
+    /// Returns the seconds.
+    fn keep_quiet(&self, error: &worker::Error) -> Option<u64> {
+        let seconds = update::retry_after(&error.to_string())?;
+        self.live.borrow_mut().quiet_until_ms = now_ms() + seconds * 1000;
+        Some(seconds)
     }
 
     /// The prompt a guest's reply is to show: of those that wait, the one that was asked
@@ -1609,14 +1663,75 @@ impl Inner {
             _ => turn.guest_reply.clone(),
         });
         let Some(reply) = reply else { return };
-        for pause in DELIVERY_BACKOFF_MS {
-            if pause > 0 {
-                Delay::from(Duration::from_millis(pause)).await;
-            }
-            match bot.edit_guest_reply(&reply, html, None).await {
-                Ok(()) => return,
-                Err(error) => console_error!("a guest's reply could not be finished: {error}"),
-            }
+        // Kept first and sent from what is kept. Many guests' replies in one chat are
+        // many edits there, and when Telegram refuses this one for coming too soon, the
+        // answer must not be lost with the attempt.
+        let now = now_ms();
+        self.update(|session| {
+            session.unsent.push(Unsent {
+                reply,
+                html: html.to_owned(),
+                since_ms: now,
+                retry_at_ms: now,
+                tries: 0,
+            });
+        });
+        self.send_unsent(bot).await;
+    }
+
+    /// Offers Telegram the replies it has still to take, those whose time has come, and
+    /// sets the alarm for what it does not take. A refusal for too many calls says how
+    /// long to wait, and that is how long this waits, however long it is; anything else
+    /// is tried a few times. Nothing is kept past [`UNSENT_KEPT_MS`].
+    async fn send_unsent(&self, bot: &Bot) {
+        let now = now_ms();
+        let due: Vec<Unsent> = {
+            let session = self.session.borrow();
+            let due = session
+                .unsent
+                .iter()
+                .filter(|unsent| unsent.retry_at_ms <= now);
+            due.cloned().collect()
+        };
+        for unsent in due {
+            let refused = bot
+                .edit_guest_reply(&unsent.reply, &unsent.html, None)
+                .await
+                .err();
+            let now = now_ms();
+            let again = refused.and_then(|error| {
+                let wait = self.keep_quiet(&error);
+                let tries = unsent.tries + 1;
+                let old = now.saturating_sub(unsent.since_ms) > UNSENT_KEPT_MS;
+                if old || (wait.is_none() && tries >= UNSENT_TRIES) {
+                    console_error!("a guest's reply was never finished: {error}");
+                    return None;
+                }
+                console_warn!("a guest's reply is not finished yet: {error}");
+                // A second more than asked: the clocks need not agree.
+                let pause = wait.map_or(UNSENT_RETRY_MS, |seconds| (seconds + 1) * 1000);
+                Some((now + pause, tries))
+            });
+            self.update(|session| match again {
+                Some((retry_at_ms, tries)) => {
+                    let kept = session.unsent.iter_mut();
+                    for kept in kept.filter(|kept| kept.reply == unsent.reply) {
+                        kept.retry_at_ms = retry_at_ms;
+                        kept.tries = tries;
+                    }
+                }
+                None => session.unsent.retain(|kept| kept.reply != unsent.reply),
+            });
+        }
+        let next = self
+            .session
+            .borrow()
+            .unsent
+            .iter()
+            .map(|unsent| unsent.retry_at_ms)
+            .min();
+        if let Some(at_ms) = next {
+            self.arm(at_ms.saturating_sub(now_ms())).await;
         }
     }
 
@@ -2253,6 +2368,12 @@ impl Inner {
     /// every early return is a retry, not an end.
     async fn on_alarm(self: &Rc<Self>) -> Result<()> {
         let cfg = self.cfg()?;
+        let bot = Bot::new(&cfg);
+        // Before anything else: this may be all the alarm was set for. It sets it again
+        // for what is left, and no later setting below pushes that back.
+        if !self.session.borrow().unsent.is_empty() {
+            self.send_unsent(&bot).await;
+        }
         let now = now_ms();
         let Some(turn) = self.turn() else {
             // Idle: stop the warm container once its time is up. A deployment without
@@ -2271,7 +2392,6 @@ impl Inner {
             return Ok(());
         };
 
-        let bot = Bot::new(&cfg);
         let running_for = now.saturating_sub(turn.started_at_ms);
         if running_for > cfg.turn_timeout_ms + STOP_GRACE_MS {
             // The turn ends here whether or not the container can be stopped right now;
