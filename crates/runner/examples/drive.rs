@@ -29,7 +29,6 @@ const SECRET: &str = "local-development-control-secret-0000";
 fn describe(event: &Value) -> Option<String> {
     let kind = event["type"].as_str()?;
     match kind {
-        "stream_event" => None,
         "assistant" | "user" => {
             let blocks = event["message"]["content"].as_array()?;
             let parts: Vec<String> = blocks
@@ -186,6 +185,12 @@ async fn main() -> anyhow::Result<()> {
             FromRunner::Event { event, .. } => {
                 if let Some(line) = describe(&event).filter(|_| !raw) {
                     println!("{line}");
+                }
+                None
+            }
+            FromRunner::Partial { text, .. } => {
+                if !raw {
+                    println!("writing: {} characters so far", text.chars().count());
                 }
                 None
             }

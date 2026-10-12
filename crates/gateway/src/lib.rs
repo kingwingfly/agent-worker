@@ -82,17 +82,20 @@ async fn telegram(mut request: Request, env: &Env, cfg: &Config) -> Result<Respo
     let Ok(update) = serde_json::from_str::<Update>(&body) else {
         return Response::empty();
     };
-    let Some((chat_id, user_id)) = update.origin() else {
+    let Some(origin) = update.origin() else {
+        // A button nothing is known about still shows as pressed until it is answered.
+        if let Some(query) = &update.callback_query {
+            let gone = Some("This is no longer open.");
+            let _ = Bot::new(cfg).answer_callback(&query.id, gone).await;
+        }
         return Response::empty();
     };
-    if !cfg.allowed_users.admits(user_id) {
-        let notice =
-            format!("This bot is private. Your Telegram user id is <code>{user_id}</code>.");
-        let _ = Bot::new(cfg).send_message(chat_id, &notice, None).await;
+    if !cfg.allowed_users.admits(origin.user_id) {
+        turn_away(cfg, &update, origin.user_id).await;
         return Response::empty();
     }
 
-    let name = format!("tg:{chat_id}");
+    let name = origin.session;
     let headers = Headers::new();
     headers.set(NAME_HEADER, &name)?;
     headers.set("content-type", "application/json")?;
@@ -106,4 +109,34 @@ async fn telegram(mut request: Request, env: &Env, cfg: &Config) -> Result<Respo
         console_error!("session {name} failed: {error}");
     }
     Response::empty()
+}
+
+/// Tells a user the allow-list leaves out that the bot is not theirs to use, in the way
+/// the update they caused can be answered: with a message, with the one reply a guest
+/// summon gets, or over the button they pressed. The id is what the operator needs to
+/// let them in.
+async fn turn_away(cfg: &Config, update: &Update, user_id: i64) {
+    let bot = Bot::new(cfg);
+    let private = "This bot is private. Your Telegram user id is";
+    let notice = format!("{private} <code>{user_id}</code>.");
+    let told = if let Some(message) = &update.message {
+        bot.send_message(message.chat.id, &notice, None)
+            .await
+            .map(drop)
+    } else if let Some(query_id) = update
+        .guest_message
+        .as_ref()
+        .and_then(|message| message.guest_query_id.as_deref())
+    {
+        bot.answer_guest(query_id, &notice, None).await.map(drop)
+    } else if let Some(query) = &update.callback_query {
+        let notice = format!("{private} {user_id}.");
+        bot.answer_callback(&query.id, Some(&notice)).await
+    } else {
+        // Nobody is waiting for an answer to a press on a draft's Stop button.
+        Ok(())
+    };
+    if let Err(error) = told {
+        console_error!("a user who is not let in could not be told: {error}");
+    }
 }

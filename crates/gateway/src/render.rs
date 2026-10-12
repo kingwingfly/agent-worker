@@ -1,6 +1,7 @@
 //! Everything the bot says, as text: Claude's Markdown turned into the HTML subset
 //! Telegram understands and cut into messages that fit, the live status line, permission
-//! prompts with their buttons, and the callback data those buttons carry.
+//! prompts with their buttons, and the callback data those buttons carry. Also what a
+//! guest summon is turned into for the agent, and the one message it gets back.
 //!
 //! Nothing here touches the network, so it is tested on the host.
 
@@ -16,6 +17,19 @@ use crate::{
 /// Telegram's limit is 4096 UTF-16 code units of text after entity parsing. Measuring the
 /// HTML source instead, with some slack, is always on the safe side.
 const MESSAGE_BUDGET: usize = 3900;
+/// The limit itself, for a message put together from parts that were measured.
+const MESSAGE_LIMIT: usize = 4096;
+/// How much of a guest's one message may go to notes about files and failures.
+const NOTES_BUDGET: usize = 1000;
+/// Starts the callback data of a button on a guest's reply, ahead of what the button
+/// would carry anywhere else. No other kind of data starts with it.
+const GUEST_PREFIX: char = 'g';
+/// Goes at the end of an answer that went on past the one message a guest gets.
+const CUT: &str = "✂️ <i>The rest did not fit: where I am a guest, I get one message.</i>";
+/// Goes ahead of what a guest is asked. The agent cannot tell from anything else that
+/// this turn's answer is cut after one message.
+const GUEST_NOTE: &str = "[Sent from a chat where you are a guest. Your reply must be a \
+                          single message under 3000 characters.]";
 const STATUS_TEXT_TAIL: usize = 1200;
 const STATUS_TOOL_LINES: usize = 6;
 const PROMPT_INPUT_LIMIT: usize = 1500;
@@ -297,6 +311,85 @@ pub fn answer(markdown: &str) -> Vec<String> {
     messages
 }
 
+/// The text Claude is writing, as a draft shows it while it grows: the last of the
+/// messages it would be sent as if it ended here, which is the one being written.
+/// `None` while there is nothing to show. Markdown that breaks off in the middle renders
+/// like any other: what is still open is closed at the end.
+pub fn draft(markdown: &str) -> Option<String> {
+    answer(markdown).pop()
+}
+
+/// All there is to say about a turn in one message, which is what a guest gets: the
+/// first of the `messages` the answer would be sent as elsewhere, a line saying so if
+/// there were more, and the `notes` on what became of files or went wrong.
+pub fn one_message(messages: &[String], notes: &[String]) -> String {
+    let mut kept = Vec::new();
+    let mut used = 0;
+    for note in notes {
+        used += units(note) + 1;
+        if used > NOTES_BUDGET {
+            kept.push("…");
+            break;
+        }
+        kept.push(note.as_str());
+    }
+    let notes = kept.join("\n");
+    let compose = |answer: &str, cut: bool| {
+        [answer, if cut { CUT } else { "" }, &notes]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    };
+    let first = messages.first().map_or("", String::as_str);
+    let whole = compose(first, messages.len() > 1);
+    if units(&whole) <= MESSAGE_LIMIT {
+        return whole;
+    }
+    // The notes need more than the slack a message of the answer leaves. Markup cannot
+    // be cut safely, so the answer loses it along with its end.
+    let room = MESSAGE_LIMIT.saturating_sub(units(&compose("", true)) + 2);
+    let text = strip_tags(first);
+    let start = split_text(&text, room).into_iter().next();
+    compose(start.unwrap_or_default().trim_end(), true)
+}
+
+/// A message without the mentions it begins with. A guest is summoned by one, so
+/// `@the_bot /stop` is the command `/stop`, and the name the bot goes by is no part of
+/// what it is asked.
+pub fn without_mentions(text: &str) -> &str {
+    let mut rest = text.trim();
+    while rest.starts_with('@') {
+        rest = rest
+            .split_once(char::is_whitespace)
+            .map_or("", |(_, rest)| rest.trim_start());
+    }
+    rest
+}
+
+/// What a guest is asked, as the agent gets it. The message it replies to, by `author`
+/// if that is known, goes ahead of it: that is usually what the question is about
+/// ("summarise this"), and the agent sees nothing else of the chat.
+pub fn guest_request(text: &str, replied: Option<(Option<&str>, &str)>) -> String {
+    let mut request = String::from(GUEST_NOTE);
+    if let Some((author, words)) = replied {
+        request.push_str("\n\n[It replies to this message");
+        if let Some(author) = author {
+            request.push_str(&format!(" from {author}"));
+        }
+        request.push_str(":]");
+        for line in words.lines() {
+            request.push_str("\n> ");
+            request.push_str(line);
+        }
+    }
+    if !text.is_empty() {
+        request.push_str("\n\n");
+        request.push_str(text);
+    }
+    request
+}
+
 /// Removes tags but leaves entities, so the result is still valid HTML text.
 fn strip_tags(html: &str) -> String {
     let mut out = String::with_capacity(html.len());
@@ -483,6 +576,28 @@ impl Callback {
 
 fn button(text: &str, callback: Callback) -> Value {
     json!({ "text": text, "callback_data": callback.encode() })
+}
+
+/// Makes a keyboard's buttons those of a guest's reply in the chat `chat_id`. A press on
+/// such a button comes with the user who pressed it but without the chat, and a guest's
+/// session is one user's in one chat, so the data has to name the chat.
+pub fn for_guest(mut keyboard: Value, chat_id: i64) -> Value {
+    let rows = keyboard["inline_keyboard"].as_array_mut();
+    for row in rows.into_iter().flatten() {
+        for button in row.as_array_mut().into_iter().flatten() {
+            if let Some(data) = button["callback_data"].as_str() {
+                button["callback_data"] = format!("{GUEST_PREFIX}{chat_id}:{data}").into();
+            }
+        }
+    }
+    keyboard
+}
+
+/// Reads the data of a button on a guest's reply: the chat the reply is in, and what the
+/// button would carry anywhere else. `None` for the data of any other button.
+pub fn guest_chat(data: &str) -> Option<(i64, &str)> {
+    let (chat_id, rest) = data.strip_prefix(GUEST_PREFIX)?.split_once(':')?;
+    Some((chat_id.parse().ok()?, rest))
 }
 
 /// A tool's input as JSON, with the fields that take least room first. What a call is
@@ -815,6 +930,23 @@ pub fn effort_picker(current: Option<Effort>) -> (String, Value) {
     (html, json!({ "inline_keyboard": rows }))
 }
 
+/// The `/effort` list where a message can have no buttons to pick from: the setting,
+/// and the words to send after the command.
+pub fn effort_levels(current: Option<Effort>) -> String {
+    let names: Vec<String> = Effort::ALL
+        .into_iter()
+        .map(Some)
+        .chain([None])
+        .map(|effort| format!("<code>{}</code>", effort_name(effort)))
+        .collect();
+    format!(
+        "🧠 <b>Effort: {}</b>\n\
+         How much work I put into an answer. Send /effort with one of {}.",
+        effort_name(current),
+        names.join(", ")
+    )
+}
+
 /// What to say once `/effort` has set something, and what its list turns into once a
 /// button has been pressed. A turn that is running keeps the level it started at.
 pub fn effort_set(effort: Option<Effort>) -> String {
@@ -833,6 +965,154 @@ mod tests {
             at_ms,
             parent,
             text: text.into(),
+        }
+    }
+
+    #[test]
+    fn a_guests_buttons_name_their_chat_and_still_fit_telegrams_limit() {
+        let request_id = "0b0e7f0a-52a5-4b56-9f6f-6f1e8f0c2a11";
+        let input = json!({ "questions": [{
+            "question": "Which?",
+            "options": [{ "label": "One" }, { "label": "Two" }],
+        }]});
+        let (_, question) = question_prompt(request_id, &input, 0).unwrap();
+        let (_, permission) = permission_prompt(request_id, "Bash", &json!({ "command": "ls" }));
+        // The longest ids there are: a supergroup's, and a user's of 52 bits.
+        for chat_id in [-1_009_999_999_999, 4_503_599_627_370_495, 7] {
+            for keyboard in [&question, &permission] {
+                let plain: Vec<&Value> = keyboard["inline_keyboard"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .flat_map(|row| row.as_array().unwrap())
+                    .collect();
+                let guest = for_guest(keyboard.clone(), chat_id);
+                let guest: Vec<&Value> = guest["inline_keyboard"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .flat_map(|row| row.as_array().unwrap())
+                    .collect();
+                assert_eq!(plain.len(), guest.len());
+                for (plain, guest) in plain.iter().zip(guest) {
+                    let data = guest["callback_data"].as_str().unwrap();
+                    assert!(data.len() <= 64, "{data}");
+                    assert_eq!(
+                        guest_chat(data),
+                        Some((chat_id, plain["callback_data"].as_str().unwrap()))
+                    );
+                    assert_eq!(guest["text"], plain["text"]);
+                    // Nothing reads it as a button of a chat the bot is in.
+                    assert_eq!(Callback::parse(data), None);
+                    assert_eq!(Pick::parse(data), None);
+                    assert_eq!(picked_effort(data), None);
+                }
+            }
+        }
+        for plain in [
+            "p:0b0e7f0a:a",
+            "q:0b0e7f0a:0:1",
+            "s:0b0e7f0a",
+            "e:high",
+            "g:x",
+            "gx:p",
+        ] {
+            assert_eq!(guest_chat(plain), None, "{plain}");
+        }
+    }
+
+    #[test]
+    fn a_guest_gets_the_answer_and_the_notes_in_one_message() {
+        let notes = ["📎 <code>a.pdf</code> went elsewhere.".to_owned()];
+        assert_eq!(one_message(&["Short.".into()], &[]), "Short.");
+        assert_eq!(
+            one_message(&["Short.".into()], &notes),
+            format!("Short.\n\n{}", notes[0])
+        );
+        // No answer at all still leaves the notes.
+        assert_eq!(one_message(&[], &notes), notes[0]);
+
+        // An answer of several messages keeps the first and says that there was more.
+        let long = "word ".repeat(2000);
+        let messages = answer(&long);
+        assert!(messages.len() > 1);
+        let one = one_message(&messages, &notes);
+        assert!(one.starts_with(&messages[0]));
+        assert!(one.ends_with(&format!("{CUT}\n\n{}", notes[0])));
+        assert!(units(&one) <= MESSAGE_LIMIT);
+
+        // Notes that need more room than a message leaves take it from the answer, and
+        // more of them than anyone would read are cut short themselves.
+        let many: Vec<String> = (0..80)
+            .map(|n| format!("📎 <code>file-{n}.pdf</code> went elsewhere."))
+            .collect();
+        let bold = format!("<b>{}</b>", "bold ".repeat(770).trim_end());
+        assert_eq!(units(&bold), 3856);
+        let one = one_message(&[bold], &many);
+        assert!(units(&one) <= MESSAGE_LIMIT, "{}", units(&one));
+        assert!(one.starts_with("bold bold"));
+        assert!(one.contains(CUT));
+        assert!(one.contains("file-0.pdf") && one.ends_with('…'));
+        assert!(!one.contains("file-79.pdf"));
+    }
+
+    #[test]
+    fn a_draft_is_the_message_being_written() {
+        assert_eq!(draft(""), None);
+        assert_eq!(draft("Here is **the"), Some("Here is **the".into()));
+        assert_eq!(
+            draft("Here is **the answer**.\n\n- first"),
+            Some("Here is <b>the answer</b>.\n\n• first".into())
+        );
+        // A code block that is still being written is closed like a finished one.
+        assert_eq!(
+            draft("Run:\n\n```sh\necho"),
+            Some("Run:\n\n<pre><code class=\"language-sh\">echo</code></pre>".into())
+        );
+        // Past one message, it is the one the text has got to.
+        let long = format!("{}\n\nThe end is near", "word ".repeat(2000));
+        assert_eq!(draft(&long), Some("The end is near".into()));
+    }
+
+    #[test]
+    fn a_guest_request_drops_the_summons_and_quotes_what_it_replies_to() {
+        assert_eq!(without_mentions("@the_bot what is this?"), "what is this?");
+        assert_eq!(
+            without_mentions("  @the_bot   @other /stop now "),
+            "/stop now"
+        );
+        assert_eq!(without_mentions("@the_bot"), "");
+        assert_eq!(
+            without_mentions("mail me@example.com"),
+            "mail me@example.com"
+        );
+        assert_eq!(without_mentions("tell @bea hello"), "tell @bea hello");
+
+        assert_eq!(
+            guest_request("what is this?", None),
+            "[Sent from a chat where you are a guest. Your reply must be a single message \
+             under 3000 characters.]\n\nwhat is this?"
+        );
+        assert_eq!(
+            guest_request("summarise", Some((Some("Bea"), "It rained.\nAll week."))),
+            format!(
+                "{GUEST_NOTE}\n\n[It replies to this message from Bea:]\n> It rained.\n> All week.\n\nsummarise"
+            )
+        );
+        // A bare summons in reply to a message asks about that message.
+        assert_eq!(
+            guest_request("", Some((None, "It rained."))),
+            format!("{GUEST_NOTE}\n\n[It replies to this message:]\n> It rained.")
+        );
+    }
+
+    #[test]
+    fn the_effort_levels_can_be_listed_without_buttons() {
+        let listed = effort_levels(Some(Effort::High));
+        assert!(listed.starts_with("🧠 <b>Effort: high</b>"));
+        for name in ["low", "medium", "high", "xhigh", "max", "auto"] {
+            assert!(listed.contains(&format!("<code>{name}</code>")), "{name}");
+            assert!(parse_effort(name).is_some());
         }
     }
 

@@ -262,6 +262,7 @@ async fn a_turn_streams_events_and_ends_with_the_result() {
         "{args:?}"
     );
     assert!(args.contains(&"mcp__approver__permission_prompt".to_owned()));
+    assert!(args.contains(&"--include-partial-messages".to_owned()));
     // The MCP servers are given inline, with the approver at the address really bound.
     let position = args.iter().position(|arg| arg == "--mcp-config").unwrap();
     let servers: serde_json::Value = serde_json::from_str(&args[position + 1]).unwrap();
@@ -280,6 +281,54 @@ async fn a_turn_streams_events_and_ends_with_the_result() {
         FromRunner::Event { turn_id, .. } | FromRunner::TurnDone { turn_id, .. } => turn_id == "t2",
         _ => false,
     }));
+}
+
+#[tokio::test]
+async fn the_text_being_written_is_passed_on_now_and_then_and_its_pieces_are_not() {
+    let harness = Harness::claimed().await;
+    let (mut socket, _) = harness.connect().await;
+
+    user_message(&mut socket, "t1", "typed words").await;
+    let (frames, result) = finish_turn(&mut socket).await;
+
+    // The first piece at once, the second not so soon after it, and the third with all
+    // that came before. Thinking, a sub-agent's text and what was written before the
+    // message was picked up are in none of them.
+    let partials: Vec<&FromRunner> = frames
+        .iter()
+        .filter(|frame| matches!(frame, FromRunner::Partial { .. }))
+        .collect();
+    let partial = |text: &str| FromRunner::Partial {
+        turn_id: "t1".into(),
+        text: text.into(),
+    };
+    assert_eq!(
+        partials,
+        [&partial("echo: "), &partial("echo: typed words")]
+    );
+
+    // The pieces themselves are no events: the numbered frames are the ones of a turn
+    // that came in whole messages.
+    let events: Vec<&str> = frames
+        .iter()
+        .filter_map(|frame| match frame {
+            FromRunner::Event { event, .. } => event["type"].as_str(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(events, ["system", "user", "assistant", "result"]);
+    let seqs: Vec<_> = frames.iter().filter_map(FromRunner::seq).collect();
+    assert_eq!(seqs, [1, 2, 3, 4, 5]);
+    assert_eq!(result.text.as_deref(), Some("echo: typed words"));
+
+    // Nothing of them is kept for a reconnecting Durable Object either.
+    drop(socket);
+    let (mut socket, _) = harness.connect().await;
+    send(&mut socket, ToRunner::Resume { after_seq: 0 }).await;
+    for seq in 1..=5 {
+        assert_eq!(next(&mut socket).await.seq(), Some(seq));
+    }
+    expect_silence(&mut socket).await;
 }
 
 #[tokio::test]

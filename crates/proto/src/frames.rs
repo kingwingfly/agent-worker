@@ -2,7 +2,8 @@
 //!
 //! Frames the runner emits carry a monotonically increasing `seq`. The runner keeps them
 //! buffered until the Durable Object acknowledges them, so a Durable Object that was
-//! evicted mid-turn can reconnect and ask for a replay.
+//! evicted mid-turn can reconnect and ask for a replay. The two that carry none,
+//! [`FromRunner::Partial`] and [`FromRunner::Heartbeat`], are worth nothing a moment later.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -115,6 +116,11 @@ pub enum FromRunner {
         turn_id: String,
         result: TurnResult,
     },
+    /// The text Claude is writing right now, as far as it has got: all of the message so
+    /// far, not what was added since the last frame, so any one of these can be lost.
+    /// The finished message follows as an [`FromRunner::Event`], which is why these are
+    /// neither numbered nor replayed.
+    Partial { turn_id: String, text: String },
     /// Keeps the connection, and so the Durable Object, alive between events.
     Heartbeat,
 }
@@ -126,7 +132,7 @@ impl FromRunner {
             Self::Event { seq, .. }
             | Self::PermissionRequest { seq, .. }
             | Self::TurnDone { seq, .. } => Some(*seq),
-            Self::Hello { .. } | Self::Heartbeat => None,
+            Self::Hello { .. } | Self::Partial { .. } | Self::Heartbeat => None,
         }
     }
 }
@@ -246,6 +252,15 @@ mod tests {
     #[test]
     fn only_replayable_frames_have_a_seq() {
         assert_eq!(FromRunner::Heartbeat.seq(), None);
+        let partial = FromRunner::Partial {
+            turn_id: "t".into(),
+            text: "so far".into(),
+        };
+        assert_eq!(partial.seq(), None);
+        assert_eq!(
+            serde_json::to_value(&partial).unwrap(),
+            json!({ "type": "partial", "turn_id": "t", "text": "so far" })
+        );
         let event = FromRunner::Event {
             seq: 7,
             turn_id: "t".into(),

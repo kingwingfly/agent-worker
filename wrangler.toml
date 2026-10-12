@@ -37,8 +37,9 @@ ALLOWED_TG_USERS = ""
 IDLE_TTL_SECS = "120"
 APPROVAL_TIMEOUT_SECS = "600"
 TURN_TIMEOUT_SECS = "1800"
-# Fresh tokens (cache reads excluded) per chat per UTC day; "0" is unlimited. Model calls
-# are refused once it is used up, in the middle of a turn too.
+# Fresh tokens (cache reads excluded) per session per UTC day; "0" is unlimited. Model
+# calls are refused once it is used up, in the middle of a turn too. A session is a chat,
+# or one user's summons of the bot as a guest in one chat.
 DAILY_TOKEN_BUDGET = "0"
 MCP_IDLE_TTL_SECS = "900"
 
@@ -54,8 +55,9 @@ class_name = "McpHostDO"
 tag = "v1"
 new_sqlite_classes = ["SessionDO", "McpHostDO"]
 
-# One agent container per chat with a turn in progress or just finished.
-# max_instances caps how many run at once.
+# One agent container per session with a turn in progress or just finished: per chat,
+# and per user who summons the bot as a guest in a chat. max_instances caps how many run
+# at once.
 [[containers]]
 class_name = "SessionDO"
 image = "./containers/agent/Dockerfile"

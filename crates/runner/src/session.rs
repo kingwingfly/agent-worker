@@ -7,6 +7,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use agent_proto::{Decision, Effort, FromRunner, ToRunner, TurnResult};
@@ -14,7 +15,7 @@ use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
-    claude::{self, ChildEvent, Claude},
+    claude::{self, ChildEvent, Claude, Piece},
     config::Config,
     state::{self, Listing},
 };
@@ -23,6 +24,10 @@ use crate::{
 /// the oldest are dropped, which costs a reconnecting client the start of a long turn's
 /// event stream but never its result.
 const MAX_UNACKED_FRAMES: usize = 20_000;
+/// The least time between two [`FromRunner::Partial`] frames of a turn. The model's
+/// response arrives a few characters at a time, and each of those is not worth a frame:
+/// whoever shows the text can only redraw it so often.
+const PARTIAL_INTERVAL: Duration = Duration::from_millis(700);
 
 enum Command {
     Attach(mpsc::UnboundedSender<FromRunner>),
@@ -89,6 +94,44 @@ struct Turn {
     /// Output directory listing when the turn began.
     before: Listing,
     interrupted: bool,
+    /// The text Claude is writing, as far as its pieces have arrived.
+    writing: String,
+    /// When that was last passed on.
+    partial_sent: Option<Instant>,
+}
+
+impl Turn {
+    /// Takes in a piece of the response Claude is receiving. Returns the text so far
+    /// when it is time to pass it on again. Its end need not be: the finished message
+    /// follows the last piece at once, as an event.
+    fn write(&mut self, line: &Value) -> Option<FromRunner> {
+        // Like a `result`, a piece that comes before Claude picked the message up
+        // belongs to something else.
+        if !self.acknowledged {
+            return None;
+        }
+        match claude::piece(line)? {
+            Piece::Begin => {
+                self.writing.clear();
+                None
+            }
+            Piece::More(text) => {
+                self.writing.push_str(text);
+                let now = Instant::now();
+                if self
+                    .partial_sent
+                    .is_some_and(|sent| now.duration_since(sent) < PARTIAL_INTERVAL)
+                {
+                    return None;
+                }
+                self.partial_sent = Some(now);
+                Some(FromRunner::Partial {
+                    turn_id: self.id.clone(),
+                    text: self.writing.clone(),
+                })
+            }
+        }
+    }
 }
 
 struct Session {
@@ -223,6 +266,13 @@ impl Session {
                     tracing::debug!("dropping claude output outside a turn");
                     return;
                 };
+                if claude::is_stream_event(&line) {
+                    // Not an event of the turn: these are neither numbered nor kept.
+                    if let Some(partial) = turn.write(&line) {
+                        self.send(partial);
+                    }
+                    return;
+                }
                 turn.acknowledged |= claude::is_replay_of(&line, &turn.message_uuid);
                 let turn_id = turn.id.clone();
                 let result =
@@ -319,6 +369,8 @@ impl Session {
             resent: false,
             before,
             interrupted: false,
+            writing: String::new(),
+            partial_sent: None,
         });
         self.deliver().await;
     }
