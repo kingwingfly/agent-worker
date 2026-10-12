@@ -30,7 +30,7 @@ Telegram ──webhook──▶ Worker
 
 1. Telegram calls `/tg/webhook`. The Worker checks the webhook secret and the user allow-list and hands the update to the chat's `SessionDO`.
 2. The session starts its container if needed, restores the previous files and transcript from R2, and opens a WebSocket to the runner.
-3. The runner feeds the message to a long-lived `claude -p --input-format stream-json` and streams events back. The session shows the tools Claude uses, and what it says before using them, in one progress message that it edits as it goes and leaves in the chat. When a prompt or a message of the user's has pushed it up the chat, it is sent again below them, so the newest message is the one that changes.
+3. The runner feeds the message to a long-lived `claude -p --input-format stream-json` and streams events back. The session shows the tools Claude uses, and what it says before using them, in one progress message that it edits as it goes and leaves in the chat. When a prompt or a message of the user's has pushed it up the chat, it is sent again below them, so the newest message is the one that changes. In a private chat the text Claude is writing is shown as well, while it is written; see "Text as it is written".
 4. A tool call that the policy does not pre-approve reaches the runner's `permission_prompt` MCP tool (`--permission-prompt-tool`). It becomes a Telegram message with **Allow / Always / Deny** buttons; Claude waits for the answer. `AskUserQuestion` arrives the same way and is shown as option buttons.
 5. When the turn ends, the answer is sent, every file created or changed under `/work/out/` during the turn is delivered as a document, and the state is saved to R2. The container is stopped after `IDLE_TTL_SECS`.
 
@@ -67,6 +67,29 @@ If the gateway refuses a request as too long before that point, Claude Code comp
 
 The session hands the level to the runner with each message. A new `claude` is launched with `--effort`. One that is already running at another level is told just before the message, with the stream-json control request `apply_flag_settings` (`effortLevel`), so nothing is restarted and a change costs no time. Claude Code puts the level into every model call as `output_config.effort`, and it does that without `/effort` too, with its own default for the model; what a level changes is up to the model behind the gateway. A higher level uses more tokens, which count against `DAILY_TOKEN_BUDGET` like any others.
 
+### Text as it is written
+
+In a private chat the bot shows what Claude is writing as a draft (`sendMessageDraft`): the bubble Telegram draws for a message that is still being typed, with a Stop button on it. Telegram's Bot API has drafts for every bot since version 9.5 and the button since 10.3. A self-hosted server from before that refuses the call, and the turn then goes on without drafts.
+
+- The runner starts `claude` with `--include-partial-messages`, which prints the model's response a few characters at a time. It does not pass those pieces on. It keeps the text so far and sends that, at most every 0.7 seconds, in a frame that is neither numbered nor replayed: a long answer comes in thousands of pieces, and each of them is worth nothing once the next has arrived.
+- A draft is a preview that Telegram removes by itself. The answer is still sent as a message when the turn is over, exactly as without drafts, and that is what stays in the chat.
+- Text that turns out to come before a tool call is not the answer. It moves into the progress message, as it always did, and the draft is left as Telegram's "Thinking…" placeholder.
+- The Stop button does what `/stop` does. Telegram reports the press as a `stopped_message_generation` update, so the webhook has to be registered for it (step 4 under "Deploy").
+
+Groups have no drafts, and neither has a chat the bot is a guest in.
+
+### As a guest in other chats
+
+With Guest Mode switched on for the bot in @BotFather, someone on the allow-list can summon it in any chat without adding it there: by mentioning it in a message, or by replying to one of its messages. Telegram hands the bot that one message (`guest_message`) and the message it replies to, and lets it answer with one message of its own, which it may change afterwards. It sees nothing else of the chat and can send nothing else there. Everything about a guest's turn follows from that.
+
+- **Whose conversation.** What one person asks the bot in one chat is a conversation of its own, with its own container, files, "Always allow" answers and daily budget: session `tg:guest:<chat>:<user>`. Other people in that chat have theirs, the same person has another in every other chat, and none of them is that person's private chat with the bot.
+- **What the agent is given.** The message without the mention it starts with, and ahead of it the message it replies to, quoted, since that is usually what the question is about ("@bot summarise this"). A line in front tells the agent that its answer has to fit in one message.
+- **One message.** The reply starts as "Working…" and shows the turn's progress. A permission prompt or a clarifying question takes its place, with its buttons, until it is answered, and several prompts are shown one after the other. Everyone in the chat sees what is asked for; only the person who summoned the bot can answer, and anyone else who presses is told so. At the end the answer replaces all of it. An answer too long for one message is cut there and says so, and a request too long to show whole in a prompt is declined, because the file it would be attached as cannot be sent.
+- **Files.** A file written to `/work/out/` goes to the private chat of the person who asked, and the reply says that it did. Telegram lets a bot write only to people who have opened a chat with it, so for anyone else the reply says that the file could not be sent.
+- **Commands.** They are sent like anything else, in a message that mentions the bot: `@your_bot /new`, `/stop`, `/status`, `/effort high`. `/resume` and `/rewind` work only in a chat with the bot itself. Their lists are buttons, and a button on a guest's reply has to carry the chat it is in, which leaves no room for what those buttons carry.
+
+A press on a guest's button reaches the Worker without the chat it happened in. The button's data names the chat for that reason, and the session is found from it and from who pressed.
+
 ## Develop
 
 ```sh
@@ -82,7 +105,7 @@ RUNNER_WORK_DIR=/tmp/agent/work RUNNER_RUNTIME_DIR=/tmp/agent/run \
 cargo run -p agent-runner --example drive -- "Create out/hello.md containing one line: hi"
 ```
 
-`drive` approves permission requests (`--deny` to decline, `--interrupt-after-ms N` to interrupt, `--effort LEVEL` to answer at a level, `--raw` for every frame). Without `AGENT_WORKER_ORIGIN` the CLI uses whatever credentials it already has.
+`drive` approves permission requests (`--deny` to decline, `--interrupt-after-ms N` to interrupt, `--effort LEVEL` to answer at a level, `--raw` for every frame). While Claude writes, it prints how far the text has got. Without `AGENT_WORKER_ORIGIN` the CLI uses whatever credentials it already has.
 
 ### Run the Worker without a container engine
 
@@ -97,7 +120,7 @@ npx wrangler dev --enable-containers=false \
   --var LLM_API_KEY:… --var SESSION_TOKEN_SECRET:…
 ```
 
-`DEV_RUNNER_URL` is for development only: all chats share that one runner, and nothing replaces it. `/new`, `/resume` and `/rewind` only take effect on it once you restart it with an empty working directory and `AGENT_CLAUDE_SESSION_ID` set to the conversation's id. `TELEGRAM_API_BASE` redirects Bot API calls, for a mock or a self-hosted Bot API server.
+`DEV_RUNNER_URL` is for development only: every session is sent to that one runner, and nothing replaces it. A runner belongs to the session that claimed it first, so to try another chat, or a guest's session next to a chat's, restart it; a second session is told that the runner belongs to an earlier start. `/new`, `/resume` and `/rewind` only take effect on it once you restart it with an empty working directory and `AGENT_CLAUDE_SESSION_ID` set to the conversation's id. `TELEGRAM_API_BASE` redirects Bot API calls, for a mock or a self-hosted Bot API server.
 
 The MCP container can be stood in for the same way. Start what runs inside it, then add `--var DEV_MCP_URL:http://127.0.0.1:8090` to the `wrangler dev` command:
 
@@ -127,9 +150,11 @@ With podman, put `WRANGLER_DOCKER_BIN="$PWD/containers/docker-via-podman"` in fr
    ```sh
    curl "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/setWebhook" \
      -d url="$PUBLIC_ORIGIN/tg/webhook" -d secret_token="$TELEGRAM_WEBHOOK_SECRET" \
-     -d 'allowed_updates=["message","callback_query"]'
+     -d 'allowed_updates=["message","callback_query","guest_message","stopped_message_generation"]'
    ```
+   Telegram sends only the kinds of update named here. A webhook registered before the last two existed has to be registered again, or the bot never hears a guest summons or a press on a draft's Stop button. The answer does not say which kinds are in force: for an address and secret it already has, it is "Webhook is already set" whether or not the list changed. `curl "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/getWebhookInfo"` shows them under `allowed_updates`. If `curl` ends with `URL rejected` after printing the answer, a space got in behind one of the backslashes when the command was pasted, and whatever followed it was not sent.
 5. Message the bot. If you are not on the allow-list it replies with your user id; add it to `ALLOWED_TG_USERS` and deploy again.
+6. To let the bot be summoned in chats it is not a member of, open its settings in @BotFather and switch on Guest Mode. Nothing has to be configured here for it; see "As a guest in other chats".
 
 ### The LLM gateway
 
@@ -211,7 +236,7 @@ To try a change without building the image, install pandoc and Typst and run `MD
 | `IDLE_TTL_SECS` | 120 | How long a container stays warm after answering |
 | `APPROVAL_TIMEOUT_SECS` | 600 | Unanswered prompts are denied after this |
 | `TURN_TIMEOUT_SECS` | 1800 | A turn is interrupted after this |
-| `DAILY_TOKEN_BUDGET` | 0 (off) | Fresh tokens per chat per UTC day, counted at the `/llm` proxy from what each model call reports. Checked when a message arrives and before every model call, so a turn that uses it up ends there |
+| `DAILY_TOKEN_BUDGET` | 0 (off) | Fresh tokens per session per UTC day, counted at the `/llm` proxy from what each model call reports. Checked when a message arrives and before every model call, so a turn that uses it up ends there. A session is a chat, or one person's summons of the bot as a guest in one chat, so someone who summons it in several chats has this much in each |
 | `MCP_IDLE_TTL_SECS` | 900 | Idle time before the MCP container stops |
 
 ## Security model
@@ -223,13 +248,14 @@ To try a change without building the image, install pandoc and Typst and run `MD
 - The system prompt and the skills are not secret from the people who chat. They are in the agent image, the agent has to read them to work, and reading needs no approval, so it can be asked to show them. Closing those files on the machine that builds the image protects that copy and nothing else.
 - Containers currently have outbound internet access. An approved shell command can therefore send data anywhere; keep the pre-approved list short. A command on that list runs with whatever arguments the agent gives it, so it has to be safe with all of them, as `md2pdf` and `mcp-file` are meant to be. The `domain` MCP server is pre-approved as a whole: if its tools return text written by third parties, that text can steer the agent into calling them, and no prompt stands in between. A web page or a search result is such text as well, and `WebFetch` sends whatever is in the address it is given to the host it names, so pre-approving it would let a page have the agent pass on what it has read.
 - A permission prompt shows what is being approved, and all of it: a request too long for the message is attached as a file. The file of an output document is uploaded to Telegram under a boundary made up for that upload, so its content cannot add to the request.
+- As a guest the bot answers only people on the allow-list, wherever they summon it, and each of them in each chat has a session nobody else reaches. A guest's prompts are in a message the whole chat reads, commands and addresses included, and are answered by the person who summoned the bot alone: a press leads to the session of whoever pressed, which for anyone else is one that never asked. The message a summons replies to is handed to the agent, and it is text by whoever wrote it, like a web page: it can try to steer the agent, and the prompts are what stands in between. Files leave a guest's turn only towards the private chat of the person who asked.
 - `SESSION_TOKEN_SECRET` must be at least 16 characters and no secret may be empty; the Worker answers 500 to everything until that is so. A short signing key could be found by trying keys against a token, and an empty webhook secret is what a request without the header presents.
 - Nothing a failed model call says reaches a container or the chat. A gateway's error names its site and quotes the ids it knows the request by, and Claude Code prints such an error into its answer word for word. So the `/llm` proxy rebuilds every error from its status and its kind (`crates/gateway/src/scrub.rs`): an error status, an `error` event inside a stream, and a status 200 whose body is an error or a page of the gateway's. It also drops every response header but the five that say what the body is and when to retry. The gateway's own words go to the Worker's log, with the chat they belong to, which is where to look when a user reports "The model service had an internal error". The bot, for its part, never shows this Worker's host, which Claude Code adds to some of its messages.
 - What a successful model call returns is passed on as it is, ids and model name included. It is not shown in the chat, but it is in the transcript inside the container, which the agent can read.
 
 ## Upgrading Claude Code
 
-The runner relies on `--permission-prompt-tool`, `--input-format stream-json`, `--replay-user-messages`, `--resume`, `--effort` and the `apply_flag_settings` control request. After changing `CLAUDE_CODE_VERSION`, run the runner against the new CLI and check with `drive` that: a non-approved Bash command produces a permission request and runs when allowed; a second prompt in the same run gets its own result; an interrupt ends the turn and the next prompt still works; restarting the runner resumes the conversation; a `drive --raw --effort high` after a run without `--effort` shows a `control_response` whose `subtype` is `success`.
+The runner relies on `--permission-prompt-tool`, `--input-format stream-json`, `--replay-user-messages`, `--include-partial-messages`, `--resume`, `--effort` and the `apply_flag_settings` control request. After changing `CLAUDE_CODE_VERSION`, run the runner against the new CLI and check with `drive` that: a non-approved Bash command produces a permission request and runs when allowed; a second prompt in the same run gets its own result; an interrupt ends the turn and the next prompt still works; restarting the runner resumes the conversation; a `drive --raw --effort high` after a run without `--effort` shows a `control_response` whose `subtype` is `success`; an answer of a few sentences prints `writing: … characters so far` more than once, and `drive --raw` shows no event of the type `stream_event`.
 
 Check that `claude -p /context --settings containers/agent/settings.json` still reports a window of 128k and an autocompact buffer: the two settings that keep long conversations compacted are read from that file, and a setting Claude Code no longer knows is ignored without a word.
 
@@ -243,3 +269,5 @@ Check as well that `claude --help` still lists the levels of `Effort` in `crates
 - Locking containers down to the Worker only (`enableInternet: false` with outbound interception).
 - Sending a file from an agent to the MCP server. Files only travel the other way.
 - Letting a container sleep while a prompt waits (`defer`), and filesystem snapshots instead of the tar archive.
+- `/resume` and `/rewind` for a guest, and one daily budget for a person across the chats they summon the bot in.
+- Drafts in the topics of a private chat. A draft is shown without a topic.

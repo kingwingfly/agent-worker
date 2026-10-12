@@ -1,6 +1,11 @@
 //! One chat's session: a Durable Object that owns the agent container, the conversation
 //! state and everything shown in Telegram.
 //!
+//! A session is that of a chat the bot is in, or of one user's summons from a chat it is
+//! a guest in ([`Session::guest`]). A guest may send one message per summons and change
+//! it afterwards, so there a turn's progress, its prompts and its answer are all shown in
+//! that one message, by turns.
+//!
 //! All durable state is in [`Session`] and the approvals table. Work is pushed forward by
 //! [`Inner::drive`], which looks at that state and does whatever is missing (start the
 //! container, restore its files, connect, hand over the message). It is safe to call at
@@ -34,7 +39,7 @@ use crate::{
     remember,
     render::{self, Callback, Pick, Status},
     store::{Approval, Checkpoint, Store},
-    update::{CallbackQuery, Update},
+    update::{CallbackQuery, Message, StoppedGeneration, Update},
 };
 
 pub const SESSION_BINDING: &str = "SESSION";
@@ -52,6 +57,9 @@ const SESSION_KEY: &str = "session";
 const WATCHDOG_MS: u64 = 30_000;
 const RETRY_MS: u64 = 2_000;
 const STATUS_EDIT_INTERVAL_MS: u64 = 2_000;
+/// The least time between two drafts of the text being written. The runner paces what it
+/// sends; this keeps what piled up behind a slow call from going out all at once.
+const DRAFT_INTERVAL_MS: u64 = 500;
 /// Stream events between acknowledgments. Prompts and results are acknowledged at once.
 const ACK_EVERY: u32 = 64;
 const MAX_DRIVE_FAILURES: u32 = 4;
@@ -83,11 +91,141 @@ const HELP: &str = "Send me a message and I'll get to work.\n\n\
     /stop — stop what I'm doing\n\
     /status — what I'm doing and today's usage";
 
+/// What a guest says about itself. Commands reach it like anything else: in a message
+/// that mentions it.
+const GUEST_HELP: &str = "Mention me with what you want, or reply to one of my messages, \
+    and I'll answer here in one message. What you ask me in this chat is a conversation of \
+    your own.\n\n\
+    /new — start a fresh conversation\n\
+    /effort — how much work I put into an answer\n\
+    /stop — stop what I'm doing\n\
+    /status — what I'm doing and today's usage";
+/// For the commands that end in a list to pick from, which a guest cannot offer: the
+/// buttons of `/resume` and `/rewind` have no room left to name the chat they are in.
+const CHAT_ONLY: &str = "That works only in a chat with me directly.";
+/// For a press that finds nothing to answer in a chat the bot is in, and where it is a
+/// guest. There the press may also be someone else's than the user's who was asked.
+const GONE: &str = "This is no longer open.";
+const GUEST_GONE: &str = "Only whoever asked me can answer this, while it is open.";
+
+/// Where what the bot says to one incoming message goes.
+enum Reply<'a> {
+    /// Into the chat, as a message of its own.
+    Chat,
+    /// Into the one reply a guest summons may get, by the id of the summons.
+    Guest(&'a str),
+}
+
+/// A message the bot sent and can change afterwards.
+enum Said {
+    /// One in the chat, by its id there.
+    Chat(i64),
+    /// The reply to a guest summons, by the id it is changed by.
+    Guest(String),
+}
+
+/// What there was to stop.
+#[derive(Clone, Copy)]
+enum Stopped {
+    /// No turn.
+    Nothing,
+    /// A turn the runner had not been given yet, which ended there and then.
+    Turn,
+    /// A turn the runner is working on. It has been told, and the turn ends when the
+    /// runner says so.
+    Runner,
+}
+
+impl Stopped {
+    fn said(self) -> &'static str {
+        match self {
+            Self::Nothing => "Nothing is running.",
+            Self::Turn => "⏹ Stopped.",
+            Self::Runner => "Stopping…",
+        }
+    }
+}
+
+/// What became of an output file. Whichever it is, the file is in R2 by then.
+enum Filed {
+    /// It is in the chat.
+    Sent,
+    /// It is larger than what is uploaded to a chat, and kept under this key.
+    TooLarge(String),
+    /// Telegram did not take it. It is kept under this key.
+    Refused(String),
+}
+
+/// The last part of an output file's path, which is what it is called in a chat.
+fn file_name(artifact: &Artifact) -> &str {
+    artifact.path.rsplit('/').next().unwrap_or(&artifact.path)
+}
+
+/// What a chat is told about a file that is kept but was not sent to it.
+fn kept_note(artifact: &Artifact, filed: &Filed) -> Option<String> {
+    let name = render::escape(file_name(artifact));
+    match filed {
+        Filed::Sent => None,
+        Filed::TooLarge(key) => Some(format!(
+            "📎 <code>{name}</code> is too large to send here ({} MB). It is stored as <code>{}</code>.",
+            artifact.size / (1024 * 1024),
+            render::escape(key),
+        )),
+        Filed::Refused(key) => Some(format!(
+            "📎 <code>{name}</code> could not be sent here. It is stored as <code>{}</code>.",
+            render::escape(key),
+        )),
+    }
+}
+
+/// What a guest's reply says about a file. It went to another chat than the one the
+/// reply is in, or to none: the bot may write only to people who opened a chat with it.
+fn guest_file_note(artifact: &Artifact, filed: Option<&Filed>) -> String {
+    let name = render::escape(file_name(artifact));
+    match filed {
+        Some(Filed::Sent) => {
+            format!("📎 <code>{name}</code> went to the private chat of whoever asked.")
+        }
+        Some(Filed::TooLarge(_)) => format!(
+            "📎 <code>{name}</code> is too large to send ({} MB).",
+            artifact.size / (1024 * 1024)
+        ),
+        Some(Filed::Refused(_)) | None => format!(
+            "📎 <code>{name}</code> could not be sent. Files go to the private chat with \
+             me, which whoever asked has to open first."
+        ),
+    }
+}
+
+/// The command a message is, if it is one. It may arrive as `/stop@name_of_the_bot`.
+fn command(text: &str) -> Option<&str> {
+    text.split_whitespace()
+        .next()
+        .filter(|word| word.starts_with('/'))
+        .map(|word| word.split('@').next().unwrap_or(word))
+}
+
+/// A name for the draft of a turn that begins now. Telegram takes any number but zero.
+/// It is told apart from the draft of the turn before, whose Stop button can still be
+/// pressed when the next turn runs.
+fn new_draft_id() -> i64 {
+    (now_ms() % i32::MAX as u64) as i64 + 1
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Session {
     /// Durable Object name, e.g. `tg:12345`.
     name: String,
     chat_id: i64,
+    /// Set for the session of a guest: the user whose summons from `chat_id` it answers.
+    /// The bot is not a member of that chat, so nothing can be sent to it; all the bot
+    /// has there is the reply each summons gets. `None` for a chat the bot is in.
+    #[serde(default)]
+    guest: Option<i64>,
+    /// The chat is one user's with the bot, which is where the text being written can
+    /// be shown as a draft.
+    #[serde(default)]
+    private: bool,
     claude_session_id: String,
     /// Secret the current container's runner was claimed with.
     control_secret: String,
@@ -136,6 +274,14 @@ struct Turn {
     /// Consecutive failed attempts to get the turn to the runner.
     #[serde(default)]
     failures: u32,
+    /// For a guest's turn, the reply its summons got: the one message all of the turn is
+    /// shown in. It is taken out when the message gets its last form.
+    #[serde(default)]
+    guest_reply: Option<String>,
+    /// Names the draft the text is shown in while Claude writes it. Zero for a turn
+    /// without one: only a private chat has drafts.
+    #[serde(default)]
+    draft_id: i64,
 }
 
 #[derive(Deserialize)]
@@ -197,6 +343,11 @@ struct Live {
     driving: bool,
     status: Status,
     last_status_edit_ms: u64,
+    last_draft_ms: u64,
+    /// A draft with text in it is on show.
+    draft_shown: bool,
+    /// Telegram did not take a draft, so the turn goes on without them.
+    drafts_off: bool,
     unacked_events: u32,
     /// The chat is being moved to another conversation, or to another point in this one.
     switching: bool,
@@ -327,6 +478,41 @@ impl Inner {
         self.session.borrow().chat_id
     }
 
+    /// Whether this is the session of a guest, see [`Session::guest`].
+    fn is_guest(&self) -> bool {
+        self.session.borrow().guest.is_some()
+    }
+
+    /// The chat files are sent to. A guest can send none where it was summoned, so its
+    /// files go to the private chat of the user it answers, which has that user's id.
+    fn files_chat(&self) -> i64 {
+        let session = self.session.borrow();
+        session.guest.unwrap_or(session.chat_id)
+    }
+
+    /// Says `html` in answer to an incoming message, and returns what it was sent as.
+    async fn reply(
+        &self,
+        bot: &Bot,
+        to: &Reply<'_>,
+        html: &str,
+        keyboard: Option<&Value>,
+    ) -> Result<Said> {
+        match to {
+            Reply::Chat => bot
+                .send_message(self.chat_id(), html, keyboard)
+                .await
+                .map(Said::Chat),
+            Reply::Guest(query_id) => {
+                let keyboard =
+                    keyboard.map(|keyboard| render::for_guest(keyboard.clone(), self.chat_id()));
+                bot.answer_guest(query_id, html, keyboard.as_ref())
+                    .await
+                    .map(Said::Guest)
+            }
+        }
+    }
+
     /// Where the conversation's saved state is.
     fn state_key(&self) -> String {
         let session = self.session.borrow();
@@ -410,49 +596,109 @@ impl Inner {
                     session.claude_session_id = random_uuid();
                 });
             }
+            let private = message.chat.is_private();
+            if self.session.borrow().private != private {
+                self.update(|session| session.private = private);
+            }
+            let to = Reply::Chat;
             match message.text.as_deref().map(str::trim) {
-                Some(text) if !text.is_empty() => self.on_text(&cfg, &bot, text).await,
+                Some(text) if !text.is_empty() => match command(text) {
+                    Some(command) => self.on_command(&cfg, &bot, &to, command, text).await,
+                    None => self.begin_turn(&cfg, &bot, &to, text).await,
+                },
                 _ => bot
                     .send_message(message.chat.id, "I can only read text messages.", None)
                     .await
                     .map(drop),
             }
+        } else if let Some(message) = update.guest_message {
+            self.on_guest(&cfg, &bot, name, &message).await
         } else if let Some(query) = update.callback_query {
             self.on_callback(&cfg, &bot, query).await
+        } else if let Some(stopped) = update.stopped_message_generation {
+            self.on_draft_stopped(&cfg, &bot, &stopped).await
         } else {
             Ok(())
         }
     }
 
-    async fn on_text(self: &Rc<Self>, cfg: &Config, bot: &Bot, text: &str) -> Result<()> {
-        let chat_id = self.chat_id();
-        // Commands may arrive as `/stop@name_of_the_bot`.
-        let command = text
-            .split_whitespace()
-            .next()
-            .filter(|word| word.starts_with('/'))
-            .map(|word| word.split('@').next().unwrap_or(word));
+    /// A message that summons the bot in a chat it is not a member of. Whatever comes of
+    /// it goes into the one reply the summons may get.
+    async fn on_guest(
+        self: &Rc<Self>,
+        cfg: &Config,
+        bot: &Bot,
+        name: &str,
+        message: &Message,
+    ) -> Result<()> {
+        // Without these there is nobody to answer, or no way to.
+        let (Some(query_id), Some(caller)) =
+            (message.guest_query_id.as_deref(), message.from.as_ref())
+        else {
+            return Ok(());
+        };
+        if self.session.borrow().name.is_empty() {
+            self.update(|session| {
+                session.name = name.to_owned();
+                session.chat_id = message.chat.id;
+                session.guest = Some(caller.id);
+                session.claude_session_id = random_uuid();
+            });
+        }
+        let to = Reply::Guest(query_id);
+        let Some(text) = message.text.as_deref() else {
+            let unread = "I can only read text messages.";
+            return self.reply(bot, &to, unread, None).await.map(drop);
+        };
+        let text = render::without_mentions(text);
+        let replied = message.replied();
+        if let Some(command) = command(text) {
+            return self.on_command(cfg, bot, &to, command, text).await;
+        }
+        if text.is_empty() && replied.is_none() {
+            // Summoned and asked nothing.
+            return self.reply(bot, &to, GUEST_HELP, None).await.map(drop);
+        }
+        let request = render::guest_request(text, replied);
+        self.begin_turn(cfg, bot, &to, &request).await
+    }
+
+    async fn on_command(
+        self: &Rc<Self>,
+        cfg: &Config,
+        bot: &Bot,
+        to: &Reply<'_>,
+        command: &str,
+        text: &str,
+    ) -> Result<()> {
+        let guest = self.is_guest();
+        let help = if guest { GUEST_HELP } else { HELP };
         let (reply, keyboard) = match command {
-            None => return self.begin_turn(cfg, bot, text).await,
-            Some("/start" | "/help") => (HELP.to_owned(), None),
-            Some("/new") => (self.reset().await?, None),
-            Some("/resume") => self.offer_resume()?,
-            Some("/rewind") => self.offer_rewind()?,
-            Some("/effort") => self.on_effort(text.split_whitespace().nth(1)),
-            Some("/stop") => (self.stop(cfg, bot).await, None),
-            Some("/status") => (self.describe(cfg)?, None),
-            Some(other) => (
-                format!("I don't know {}.\n\n{HELP}", render::escape(other)),
+            "/start" | "/help" => (help.to_owned(), None),
+            "/new" => (self.reset().await?, None),
+            "/resume" | "/rewind" if guest => (CHAT_ONLY.to_owned(), None),
+            "/resume" => self.offer_resume()?,
+            "/rewind" => self.offer_rewind()?,
+            "/effort" => self.on_effort(text.split_whitespace().nth(1)),
+            "/stop" => (self.stop(cfg, bot).await.said().to_owned(), None),
+            "/status" => (self.describe(cfg)?, None),
+            other => (
+                format!("I don't know {}.\n\n{help}", render::escape(other)),
                 None,
             ),
         };
-        bot.send_message(chat_id, &reply, keyboard.as_ref())
+        self.reply(bot, to, &reply, keyboard.as_ref())
             .await
             .map(drop)
     }
 
-    async fn begin_turn(self: &Rc<Self>, cfg: &Config, bot: &Bot, text: &str) -> Result<()> {
-        let chat_id = self.chat_id();
+    async fn begin_turn(
+        self: &Rc<Self>,
+        cfg: &Config,
+        bot: &Bot,
+        to: &Reply<'_>,
+        text: &str,
+    ) -> Result<()> {
         let refusal = if self.turn().is_some() {
             Some("I'm still working on your previous message. Send /stop to cancel it.")
         } else if self.live.borrow().switching {
@@ -464,7 +710,7 @@ impl Inner {
             None
         };
         if let Some(refusal) = refusal {
-            return bot.send_message(chat_id, refusal, None).await.map(drop);
+            return self.reply(bot, to, refusal, None).await.map(drop);
         }
 
         // Record the turn before the first await, so a second message cannot slip in.
@@ -478,17 +724,34 @@ impl Inner {
                 delivered: false,
                 stop_requested: false,
                 failures: 0,
+                guest_reply: None,
+                draft_id: if session.private { new_draft_id() } else { 0 },
             });
         });
         {
             let mut live = self.live.borrow_mut();
             live.status = Status::default();
             live.last_status_edit_ms = 0;
+            live.last_draft_ms = 0;
+            live.draft_shown = false;
+            live.drafts_off = false;
         }
-        let status = bot.send_message(chat_id, render::WORKING, None).await.ok();
+        let shown = self.reply(bot, to, render::WORKING, None).await;
+        if let (Reply::Guest(_), Err(cause)) = (to, &shown) {
+            // The reply is all a guest's turn can be shown in. A turn that could tell
+            // nobody how it went is not begun.
+            self.update(|session| session.turn = None);
+            return Err(error(format!(
+                "a guest summons could not be answered: {cause}"
+            )));
+        }
         self.update(|session| {
             if let Some(turn) = &mut session.turn {
-                turn.status_message_id = status;
+                match shown {
+                    Ok(Said::Chat(message_id)) => turn.status_message_id = Some(message_id),
+                    Ok(Said::Guest(reply)) => turn.guest_reply = Some(reply),
+                    Err(_) => {}
+                }
             }
         });
 
@@ -547,7 +810,12 @@ impl Inner {
             })
             .await?;
         self.discard(unkept).await;
-        Ok("Started a fresh conversation. /resume goes back to an earlier one.".into())
+        let done = if self.is_guest() {
+            "Started a fresh conversation."
+        } else {
+            "Started a fresh conversation. /resume goes back to an earlier one."
+        };
+        Ok(done.into())
     }
 
     // ----- Earlier conversations, and earlier points in this one -----
@@ -648,10 +916,18 @@ impl Inner {
     /// Nothing has to be stopped for it: the level is handed over with each message, so
     /// it is the next turn that sees it.
     fn on_effort(&self, named: Option<&str>) -> (String, Option<Value>) {
-        let picker = || render::effort_picker(self.session.borrow().effort);
+        // A guest's list has no buttons: it names the levels to send instead.
+        let picker = || {
+            let effort = self.session.borrow().effort;
+            if self.is_guest() {
+                (render::effort_levels(effort), None)
+            } else {
+                let (html, keyboard) = render::effort_picker(effort);
+                (html, Some(keyboard))
+            }
+        };
         let Some(word) = named else {
-            let (html, keyboard) = picker();
-            return (html, Some(keyboard));
+            return picker();
         };
         match render::parse_effort(word) {
             Some(effort) => {
@@ -661,7 +937,7 @@ impl Inner {
             None => {
                 let (html, keyboard) = picker();
                 let unknown = format!("I don't know the level {}.", render::escape(word));
-                (format!("{unknown}\n\n{html}"), Some(keyboard))
+                (format!("{unknown}\n\n{html}"), keyboard)
             }
         }
     }
@@ -770,10 +1046,10 @@ impl Inner {
         Ok(keys)
     }
 
-    /// `/stop`.
-    async fn stop(&self, cfg: &Config, bot: &Bot) -> String {
+    /// `/stop`, and the Stop button of a draft.
+    async fn stop(&self, cfg: &Config, bot: &Bot) -> Stopped {
         let Some(turn) = self.turn() else {
-            return "Nothing is running.".into();
+            return Stopped::Nothing;
         };
         if !turn.delivered {
             // The runner has not been given the message, so there is nothing to
@@ -781,7 +1057,7 @@ impl Inner {
             // reads the turn again before sending and finds it gone.
             self.close_turn(cfg.idle_ttl_ms).await;
             self.close_status(bot, &turn, render::STOPPED).await;
-            return "⏹ Stopped.".into();
+            return Stopped::Turn;
         }
         self.update(|session| {
             if let Some(turn) = &mut session.turn {
@@ -792,7 +1068,36 @@ impl Inner {
             // Not connected right now; `drive` reconnects and passes the interrupt on.
             self.arm(RETRY_MS).await;
         }
-        "Stopping…".into()
+        Stopped::Runner
+    }
+
+    /// The Stop button of a draft was pressed, which means what `/stop` means. The
+    /// press is for the turn the draft was of: one that arrives when that turn is over
+    /// says nothing about the next.
+    async fn on_draft_stopped(
+        &self,
+        cfg: &Config,
+        bot: &Bot,
+        stopped: &StoppedGeneration,
+    ) -> Result<()> {
+        let pressed = stopped.draft_id;
+        if !self
+            .turn()
+            .is_some_and(|turn| turn.draft_id != 0 && turn.draft_id == pressed)
+        {
+            return Ok(());
+        }
+        // Telegram took the draft away with the press.
+        self.live.borrow_mut().draft_shown = false;
+        match self.stop(cfg, bot).await {
+            // Nothing else will say that this turn is over.
+            ended @ Stopped::Turn => bot
+                .send_message(self.chat_id(), ended.said(), None)
+                .await
+                .map(drop),
+            // The button gave way under the press, and the end of the turn says the rest.
+            Stopped::Runner | Stopped::Nothing => Ok(()),
+        }
     }
 
     fn describe(&self, cfg: &Config) -> Result<String> {
@@ -960,8 +1265,12 @@ impl Inner {
                 // starting it, as a hand-started one is.
                 self.update(|session| session.needs_restore = session.has_state);
                 // Prompts the previous runner was waiting on died with it.
-                self.close_approvals(&Bot::new(cfg), false, "The agent was restarted.")
+                let closed = self
+                    .close_approvals(&Bot::new(cfg), false, "The agent was restarted.")
                     .await;
+                if closed {
+                    self.redraw_status().await;
+                }
             }
             Claim::Lost => {
                 // Nothing can talk to that process again. Only this warrants throwing
@@ -1105,6 +1414,8 @@ impl Inner {
     async fn on_frame(self: &Rc<Self>, frame: FromRunner) {
         let seq = match &frame {
             FromRunner::Heartbeat => return,
+            // Not a numbered frame: it is shown or it is not, and nothing is kept of it.
+            FromRunner::Partial { turn_id, text } => return self.show_draft(turn_id, text).await,
             FromRunner::Hello { last_seq, .. } => {
                 // A runner that has sent less than we have seen is a new one.
                 let after_seq = self.update(|session| {
@@ -1149,6 +1460,9 @@ impl Inner {
         match frame {
             FromRunner::Event { turn_id, event, .. } if Some(&turn_id) == current.as_ref() => {
                 if self.live.borrow_mut().status.observe(&event) {
+                    // A tool call: what Claude wrote before it was not the answer, and
+                    // is part of the progress now.
+                    self.clear_draft().await;
                     self.show_status().await;
                 }
             }
@@ -1213,10 +1527,14 @@ impl Inner {
     /// prompt is open: until it is answered, the prompt is what should be read first.
     async fn redraw_status(&self) {
         let Some(turn) = self.turn() else { return };
-        let (Some(message_id), Ok(cfg)) = (turn.status_message_id, self.cfg()) else {
+        let Ok(cfg) = self.cfg() else { return };
+        let bot = Bot::new(&cfg);
+        if self.is_guest() {
+            return self.redraw_guest_reply(&bot, &turn).await;
+        }
+        let Some(message_id) = turn.status_message_id else {
             return;
         };
-        let bot = Bot::new(&cfg);
         let chat_id = self.chat_id();
         let html = self.live.borrow().status.render(render::WORKING);
         let prompt_is_open = self.store.approvals().is_ok_and(|open| !open.is_empty());
@@ -1250,10 +1568,118 @@ impl Inner {
         let _ = bot.delete_message(chat_id, left_over).await;
     }
 
+    /// Draws a guest's reply as its turn stands: the prompt that waits for an answer, if
+    /// one does, and the progress otherwise. One message has to do for both, so a prompt
+    /// takes the place of the progress until it is answered.
+    async fn redraw_guest_reply(&self, bot: &Bot, turn: &Turn) {
+        let Some(reply) = &turn.guest_reply else {
+            return;
+        };
+        let (html, keyboard) = match self.guest_prompt() {
+            Some((html, keyboard)) => (html, Some(keyboard)),
+            None => (self.live.borrow().status.render(render::WORKING), None),
+        };
+        let _ = bot.edit_guest_reply(reply, &html, keyboard.as_ref()).await;
+    }
+
+    /// The prompt a guest's reply is to show: of those that wait, the one that was asked
+    /// first, at the question it has got to.
+    fn guest_prompt(&self) -> Option<(String, Value)> {
+        let approval = self.store.approvals().ok()?.into_iter().next()?;
+        let (html, keyboard) = if approval.tool_name == ASK_USER_QUESTION {
+            let next = approval.answers.len();
+            render::question_prompt(&approval.request_id, &approval.input, next)?
+        } else {
+            render::permission_prompt(&approval.request_id, &approval.tool_name, &approval.input)
+        };
+        Some((html, render::for_guest(keyboard, self.chat_id())))
+    }
+
+    /// Gives a guest's reply its last form, which a turn that is over has to get: there
+    /// is no other message to say how it went. Nothing touches the reply after this.
+    async fn close_guest_reply(&self, bot: &Bot, turn: &Turn, html: &str) {
+        // Read from the open turn where there still is one, as in `close_status`.
+        let reply = self.update(|session| match &mut session.turn {
+            Some(open) if open.id == turn.id => open.guest_reply.take(),
+            _ => turn.guest_reply.clone(),
+        });
+        let Some(reply) = reply else { return };
+        for pause in DELIVERY_BACKOFF_MS {
+            if pause > 0 {
+                Delay::from(Duration::from_millis(pause)).await;
+            }
+            match bot.edit_guest_reply(&reply, html, None).await {
+                Ok(()) => return,
+                Err(error) => console_error!("a guest's reply could not be finished: {error}"),
+            }
+        }
+    }
+
+    // ----- The text being written -----
+
+    /// Shows what Claude is writing as a draft, the message Telegram draws as still
+    /// being typed. It is a preview only: the answer is sent when the turn is over, as
+    /// it is without drafts, and the draft goes when a message arrives.
+    async fn show_draft(&self, turn_id: &str, text: &str) {
+        let Some(turn) = self
+            .turn()
+            .filter(|turn| turn.id == turn_id && turn.draft_id != 0 && !turn.stop_requested)
+        else {
+            return;
+        };
+        let now = now_ms();
+        {
+            let mut live = self.live.borrow_mut();
+            if live.drafts_off || now.saturating_sub(live.last_draft_ms) < DRAFT_INTERVAL_MS {
+                return;
+            }
+            live.last_draft_ms = now;
+        }
+        if let Some(html) = render::draft(text) {
+            self.send_draft(&turn, &html).await;
+        }
+    }
+
+    /// Takes the text off the draft once it turned out not to be the answer. What is
+    /// left is Telegram's placeholder for a message that is on its way.
+    async fn clear_draft(&self) {
+        if !self.live.borrow().draft_shown {
+            return;
+        }
+        if let Some(turn) = self.turn() {
+            self.send_draft(&turn, "").await;
+        }
+    }
+
+    async fn send_draft(&self, turn: &Turn, html: &str) {
+        let Ok(cfg) = self.cfg() else { return };
+        let sent = Bot::new(&cfg)
+            .send_draft(self.chat_id(), turn.draft_id, html)
+            .await;
+        let mut live = self.live.borrow_mut();
+        match sent {
+            Ok(true) => live.draft_shown = !html.is_empty(),
+            Ok(false) => {}
+            Err(error) => {
+                // An older Bot API server, for one, has no drafts. The turn loses
+                // nothing but the preview.
+                console_warn!("no drafts for this turn: {error}");
+                live.drafts_off = true;
+            }
+        }
+    }
+
     /// Gives the progress message its last form when a turn is over. It stays in the chat
     /// as the record of what was done; one that never got past "Working…" is removed.
     /// Nothing touches the message after this.
+    ///
+    /// A guest's turn has no progress message: its reply gets the heading, until the
+    /// answer takes its place.
     async fn close_status(&self, bot: &Bot, turn: &Turn, heading: &str) {
+        if self.is_guest() {
+            let html = self.live.borrow().status.render(heading);
+            return self.close_guest_reply(bot, turn, &html).await;
+        }
         // Read from the open turn where there still is one: `turn` may be a copy made
         // before the message was last moved.
         let message_id = self.update(|session| match &mut session.turn {
@@ -1304,28 +1730,55 @@ impl Inner {
             render::permission_prompt(&request_id, &tool_name, &input)
         };
         let bot = Bot::new(&cfg);
+        let guest = self.is_guest();
         // An answer covers all of a request, so one too long for its prompt goes ahead
         // of it as a file. If that cannot be sent the user is not asked, and the request
         // is declined like any other that could not be shown.
         if tool_name != ASK_USER_QUESTION
             && let Some(whole) = render::permission_overflow(&tool_name, &input)
         {
-            bot.send_document(self.chat_id(), render::REQUEST_FILE, whole.as_bytes())
+            if guest {
+                // The file would have to be where the prompt is, and a guest can send
+                // none there.
+                return Err(error("the request is too long to show as a guest"));
+            }
+            let file = whole.as_bytes();
+            bot.send_document(self.chat_id(), render::REQUEST_FILE, file, None)
                 .await?;
         }
-        let message_id = bot
-            .send_message(self.chat_id(), &html, Some(&keyboard))
-            .await?;
-        self.bury_status();
-        self.store.put_approval(&Approval {
+        let mut approval = Approval {
             request_id,
             turn_id,
             tool_name,
             input,
-            message_id,
+            message_id: 0,
             deadline_ms: now_ms() + cfg.approval_timeout_ms,
             answers: Default::default(),
-        })
+        };
+        if guest {
+            // The prompt goes into the reply, in place of the progress. Behind an
+            // earlier one it waits there until that is answered, see `guest_prompt`.
+            let reply = self
+                .turn()
+                .and_then(|turn| turn.guest_reply)
+                .ok_or_else(|| error("the reply to ask in is gone"))?;
+            let first = self.store.approvals()?.is_empty();
+            self.store.put_approval(&approval)?;
+            if first {
+                let keyboard = render::for_guest(keyboard, self.chat_id());
+                let shown = bot.edit_guest_reply(&reply, &html, Some(&keyboard)).await;
+                if shown.is_err() {
+                    self.store.delete_approval(&approval.request_id)?;
+                }
+                shown?;
+            }
+            return Ok(());
+        }
+        approval.message_id = bot
+            .send_message(self.chat_id(), &html, Some(&keyboard))
+            .await?;
+        self.bury_status();
+        self.store.put_approval(&approval)
     }
 
     async fn on_callback(
@@ -1334,24 +1787,35 @@ impl Inner {
         bot: &Bot,
         query: CallbackQuery,
     ) -> Result<()> {
-        if let Some(pick) = query.data.as_deref().and_then(Pick::parse) {
+        // A button on a guest's reply names its chat ahead of what it stands for.
+        let data = query
+            .data
+            .as_deref()
+            .map(|data| render::guest_chat(data).map_or(data, |(_, rest)| rest));
+        if let Some(pick) = data.and_then(Pick::parse) {
             return self.on_pick(bot, &query, pick).await;
         }
-        if let Some(effort) = query.data.as_deref().and_then(render::picked_effort) {
+        if let Some(effort) = data.and_then(render::picked_effort) {
             self.update(|session| session.effort = effort);
             return self
                 .close_list(bot, &query, &render::effort_set(effort))
                 .await;
         }
-        let callback = query.data.as_deref().and_then(Callback::parse);
+        let callback = data.and_then(Callback::parse);
         let approval = match &callback {
             Some(callback) => self.store.approval(callback.request_id())?,
             None => None,
         };
+        // A guest's session is that of the user it answers, so nobody else's press gets
+        // here. It gets to a session of their own, which has no such prompt.
+        let guest = self.is_guest();
         let (Some(callback), Some(mut approval)) = (callback, approval) else {
-            return bot
-                .answer_callback(&query.id, Some("This is no longer open."))
-                .await;
+            let gone = if query.message.is_none() {
+                GUEST_GONE
+            } else {
+                GONE
+            };
+            return bot.answer_callback(&query.id, Some(gone)).await;
         };
         let chat_id = self.chat_id();
 
@@ -1392,6 +1856,10 @@ impl Inner {
                     // More to ask: the same message turns into the next question.
                     self.store.put_approval(&approval)?;
                     let _ = bot.answer_callback(&query.id, None).await;
+                    if guest {
+                        self.redraw_status().await;
+                        return Ok(());
+                    }
                     return bot
                         .edit_message(chat_id, approval.message_id, &html, Some(&keyboard))
                         .await;
@@ -1428,11 +1896,15 @@ impl Inner {
         if always && let Some(key) = remember::key(&approval.tool_name, &approval.input) {
             self.store.remember(&key)?;
         }
-        let (prompt, _) = self.prompt_of(&approval);
-        let html = format!("{prompt}\n\n{outcome}");
-        let edited = bot
-            .edit_message(chat_id, approval.message_id, &html, None)
-            .await;
+        // A guest's prompt was shown in the reply, which the progress takes back below.
+        let edited = if guest {
+            Ok(())
+        } else {
+            let (prompt, _) = self.prompt_of(&approval);
+            let html = format!("{prompt}\n\n{outcome}");
+            bot.edit_message(chat_id, approval.message_id, &html, None)
+                .await
+        };
         // With the prompt answered, the progress is what to watch again.
         self.redraw_status().await;
         edited
@@ -1480,15 +1952,19 @@ impl Inner {
     }
 
     /// Closes every open prompt, telling Claude `reason` where a runner still listens.
-    async fn close_approvals(&self, bot: &Bot, only_expired: bool, reason: &str) {
+    /// Returns whether there was one to close.
+    async fn close_approvals(&self, bot: &Bot, only_expired: bool, reason: &str) -> bool {
         let now = now_ms();
         let Ok(approvals) = self.store.approvals() else {
-            return;
+            return false;
         };
+        let guest = self.is_guest();
+        let mut closed = false;
         for approval in approvals {
             if only_expired && approval.deadline_ms > now {
                 continue;
             }
+            closed = true;
             self.send(&ToRunner::PermissionDecision {
                 request_id: approval.request_id.clone(),
                 decision: Decision::Deny {
@@ -1496,12 +1972,18 @@ impl Inner {
                 },
             });
             let _ = self.store.delete_approval(&approval.request_id);
+            if guest {
+                // It has no message of its own to mark: the reply it was shown in goes
+                // on to whatever the turn has to show next.
+                continue;
+            }
             let (prompt, _) = self.prompt_of(&approval);
             let html = format!("{prompt}\n\n<b>⌛ Expired</b>");
             let _ = bot
                 .edit_message(self.chat_id(), approval.message_id, &html, None)
                 .await;
         }
+        closed
     }
 
     // ----- Finishing a turn -----
@@ -1557,6 +2039,9 @@ impl Inner {
                 (render::FAILED, vec![message])
             }
         };
+        if self.is_guest() {
+            return self.report_as_guest(&bot, turn, result, &messages).await;
+        }
         self.close_status(&bot, turn, heading).await;
         let mut problems = Vec::new();
         for message in &messages {
@@ -1569,7 +2054,17 @@ impl Inner {
 
         self.close_approvals(&bot, false, "The turn is over.").await;
         for artifact in &result.artifacts {
-            if let Err(error) = self.deliver_artifact(&bot, turn, artifact).await {
+            let told = match self.deliver_artifact(&bot, turn, artifact).await {
+                Ok(filed) => match kept_note(artifact, &filed) {
+                    Some(note) => bot
+                        .send_message(self.chat_id(), &note, None)
+                        .await
+                        .map(drop),
+                    None => Ok(()),
+                },
+                Err(error) => Err(error),
+            };
+            if let Err(error) = told {
                 console_error!("delivering {} failed: {error}", artifact.path);
                 problems.push(format!(
                     "I could not send {}.",
@@ -1588,25 +2083,65 @@ impl Inner {
         }
     }
 
+    /// What [`Self::report_turn`] owes a guest, whose one message has to say all of it:
+    /// the answer, as much of it as fits, and under it what became of the files and what
+    /// went wrong. So the message is written last, when all of that is known.
+    async fn report_as_guest(
+        &self,
+        bot: &Bot,
+        turn: &Turn,
+        result: &TurnResult,
+        messages: &[String],
+    ) {
+        self.close_approvals(bot, false, "The turn is over.").await;
+        let mut notes = Vec::new();
+        for artifact in &result.artifacts {
+            let filed = self.deliver_artifact(bot, turn, artifact).await;
+            if let Err(error) = &filed {
+                console_error!("delivering {} failed: {error}", artifact.path);
+            }
+            notes.push(guest_file_note(artifact, filed.as_ref().ok()));
+        }
+        if let Err(error) = self.save_state(turn).await {
+            console_error!("saving session state failed: {error}");
+            notes.push("⚠️ I could not save this conversation; it may be forgotten.".to_owned());
+        }
+        let html = render::one_message(messages, &notes);
+        self.close_guest_reply(bot, turn, &html).await;
+    }
+
     /// Gives up on a turn the runner will never finish.
     async fn abandon_turn(&self, message: &str) {
         let turn = self.update(|session| session.turn.take());
         if let Ok(cfg) = self.cfg() {
             let bot = Bot::new(&cfg);
-            if let Some(turn) = &turn {
+            let guest = self.is_guest();
+            if let Some(turn) = &turn
+                && !guest
+            {
                 self.close_status(&bot, turn, render::FAILED).await;
             }
             self.close_approvals(&bot, false, "The turn was abandoned.")
                 .await;
-            let _ = self.deliver(&bot, message).await;
+            match &turn {
+                // Why it ended is all the reply has left to say.
+                Some(turn) if guest => self.close_guest_reply(&bot, turn, message).await,
+                _ if guest => {}
+                _ => {
+                    let _ = self.deliver(&bot, message).await;
+                }
+            }
         }
         // Whatever container is left is stopped by the idle branch of the alarm.
         self.update(|session| session.idle_deadline_ms = now_ms());
         self.arm(RETRY_MS).await;
     }
 
-    /// Copies an output file to R2 and, if it is small enough, into the chat.
-    async fn deliver_artifact(&self, bot: &Bot, turn: &Turn, artifact: &Artifact) -> Result<()> {
+    /// Copies an output file to R2 and, if it is small enough, into the chat: for a
+    /// guest, the private chat of the user it answers, see [`Self::files_chat`]. What
+    /// is said about a file that was not sent is up to the caller, which knows where
+    /// that can be said.
+    async fn deliver_artifact(&self, bot: &Bot, turn: &Turn, artifact: &Artifact) -> Result<Filed> {
         let mut url = Url::parse("http://runner/files/out")?;
         url.path_segments_mut()
             .map_err(|()| error("bad artifact URL"))?
@@ -1617,40 +2152,34 @@ impl Inner {
         let bucket = self.env.bucket(STATE_BUCKET)?;
         let name = self.session.borrow().name.clone();
         let key = format!("artifacts/{name}/{}/{}", turn.id, artifact.path);
-        let file_name = artifact.path.rsplit('/').next().unwrap_or(&artifact.path);
-        let chat_id = self.chat_id();
+        let file_name = file_name(artifact);
+        let chat_id = self.files_chat();
+        // In that chat nothing else says where a file suddenly comes from.
+        let caption = self
+            .is_guest()
+            .then_some("From what you asked me in another chat.");
 
         if artifact.size > TELEGRAM_FILE_LIMIT {
             let stream = FixedLengthStream::wrap(response.stream()?, artifact.size);
             bucket.put(key.clone(), stream).execute().await?;
-            let note = format!(
-                "📎 <code>{}</code> is too large to send here ({} MB). It is stored as <code>{}</code>.",
-                render::escape(file_name),
-                artifact.size / (1024 * 1024),
-                render::escape(&key),
-            );
-            return bot.send_message(chat_id, &note, None).await.map(drop);
+            return Ok(Filed::TooLarge(key));
         }
 
         // Stored first: the container's copy is gone once it stops, so a file Telegram
         // will not take must still exist somewhere.
         let bytes = response.bytes().await?;
         let stored = bucket.put(key.clone(), bytes.clone()).execute().await;
-        match (bot.send_document(chat_id, file_name, &bytes).await, stored) {
-            (Ok(()), Ok(_)) => Ok(()),
+        let sent = bot.send_document(chat_id, file_name, &bytes, caption).await;
+        match (sent, stored) {
+            (Ok(()), Ok(_)) => Ok(Filed::Sent),
             (Ok(()), Err(error)) => {
                 // The user has the file; only the archive copy is missing.
                 console_error!("storing {key} failed: {error}");
-                Ok(())
+                Ok(Filed::Sent)
             }
             (Err(error), Ok(_)) => {
                 console_error!("sending {file_name} failed: {error}");
-                let note = format!(
-                    "📎 <code>{}</code> could not be sent here. It is stored as <code>{}</code>.",
-                    render::escape(file_name),
-                    render::escape(&key),
-                );
-                bot.send_message(chat_id, &note, None).await.map(drop)
+                Ok(Filed::Refused(key))
             }
             (Err(error), Err(_)) => Err(error),
         }
@@ -1754,12 +2283,19 @@ impl Inner {
                 }
             });
             self.send(&ToRunner::Interrupt);
-            let _ = bot
-                .send_message(self.chat_id(), "⏱ This is taking too long; stopping.", None)
-                .await;
+            // A guest has no message to say it in. Its reply says how the turn ended.
+            if !self.is_guest() {
+                let late = "⏱ This is taking too long; stopping.";
+                let _ = bot.send_message(self.chat_id(), late, None).await;
+            }
         }
-        self.close_approvals(&bot, true, "The user did not answer in time.")
+        let expired = self
+            .close_approvals(&bot, true, "The user did not answer in time.")
             .await;
+        if expired {
+            // A prompt nobody answered gives way to the progress again.
+            self.redraw_status().await;
+        }
 
         self.warm_mcp();
         self.arm(WATCHDOG_MS).await;

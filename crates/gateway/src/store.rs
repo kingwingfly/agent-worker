@@ -99,8 +99,9 @@ impl Store {
         Ok(())
     }
 
+    /// The prompts that wait for an answer, in the order they were asked in.
     pub fn approvals(&self) -> Result<Vec<Approval>> {
-        let rows = self.texts("SELECT body AS v FROM approvals", Vec::new())?;
+        let rows = self.texts("SELECT body AS v FROM approvals ORDER BY rowid", Vec::new())?;
         Ok(rows
             .iter()
             .filter_map(|json| serde_json::from_str(json).ok())
