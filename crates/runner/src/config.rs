@@ -40,9 +40,13 @@ pub struct Config {
     pub state_max_bytes: u64,
 }
 
-/// What a hosted chat agent needs: a shell, files, skills and clarifying questions.
-/// Left out on purpose are web access, subagents and anything that schedules work.
-pub const DEFAULT_TOOLS: &str = "Bash,Read,Edit,Write,Skill,AskUserQuestion";
+/// What a hosted chat agent needs: a shell, files, skills, clarifying questions and the
+/// web. Left out on purpose are subagents and anything that schedules work.
+///
+/// The two web tools are not alike. `WebFetch` runs here: Claude Code downloads the page
+/// and has the small model read it. `WebSearch` is run by whoever answers the model
+/// calls, as a tool of theirs that Claude Code names in a call of its own.
+pub const DEFAULT_TOOLS: &str = "Bash,Read,Edit,Write,Skill,AskUserQuestion,WebSearch,WebFetch";
 
 /// The Worker, which fronts both the LLM gateway and the shared MCP server.
 #[derive(Debug, Clone)]

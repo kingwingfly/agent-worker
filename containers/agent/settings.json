@@ -1,8 +1,21 @@
 {
-  "disableBundledSkills": true,
   "skillOverrides": {
+    "batch": "off",
+    "claude-api": "off",
+    "code-review": "off",
+    "debug": "off",
     "doctor": "off",
-    "plugin-authoring": "off"
+    "fewer-permission-prompts": "off",
+    "init": "off",
+    "keybindings-help": "off",
+    "plugin-authoring": "off",
+    "run": "off",
+    "run-skill-generator": "off",
+    "security-review": "off",
+    "simplify": "off",
+    "update-config": "off",
+    "verify": "off",
+    "workflow-authoring": "off"
   },
   "autoCompactEnabled": true,
   "autoCompactWindow": 128000

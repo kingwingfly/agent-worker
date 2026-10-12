@@ -44,7 +44,8 @@ COPY --from=build /src/target/release/runner /usr/local/bin/runner
 # Root-owned, so the agent cannot rewrite its own permissions or instructions.
 COPY containers/agent/managed-settings.json /etc/claude-code/managed-settings.json
 COPY containers/agent/system.md /etc/agent/system.md
-# Switches off the skills that ship with Claude Code, so the agent sees only ours, and
+# Switches off, by name, the skills that ship with Claude Code for working on code and on
+# Claude Code itself, so the agent is shown ours and the few that suit a chat. It also
 # has long conversations compacted, at a size that does not depend on the model's name.
 COPY containers/agent/settings.json /etc/agent/settings.json
 COPY containers/agent/md2pdf/md2pdf /usr/local/bin/md2pdf
