@@ -1,4 +1,5 @@
 //! The parts of a Telegram update the bot looks at, and the session each belongs to.
+//! Also the one thing Telegram says to a call that the bot acts on, see [`retry_after`].
 
 use serde::Deserialize;
 
@@ -78,6 +79,13 @@ pub struct CallbackQuery {
 pub struct StoppedGeneration {
     pub chat: Chat,
     pub draft_id: i64,
+}
+
+/// For how many seconds Telegram asks to be left alone, if `refusal` is what it says to
+/// a call that came too soon after others: "Too Many Requests: retry after 35".
+pub fn retry_after(refusal: &str) -> Option<u64> {
+    let (_, seconds) = refusal.rsplit_once("Too Many Requests: retry after ")?;
+    seconds.trim().parse().ok()
 }
 
 /// Where an update belongs and who caused it.
@@ -224,6 +232,19 @@ mod tests {
         assert_eq!(press(8, &data).origin(), origin("tg:guest:-1001:8", 8));
         // A button that names no chat cannot be on a guest's reply.
         assert_eq!(press(7, "p:x:a").origin(), None);
+    }
+
+    #[test]
+    fn a_call_refused_for_coming_too_often_says_how_long_to_wait() {
+        let refused = "telegram editMessageText: Too Many Requests: retry after 35";
+        assert_eq!(retry_after(refused), Some(35));
+        assert_eq!(retry_after("Too Many Requests: retry after 4\n"), Some(4));
+        assert_eq!(
+            retry_after("telegram editMessageText: Bad Request: MESSAGE_ID_INVALID"),
+            None
+        );
+        assert_eq!(retry_after("Too Many Requests: retry after soon"), None);
+        assert_eq!(retry_after(""), None);
     }
 
     #[test]
