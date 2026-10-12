@@ -76,9 +76,11 @@ pub fn args(cfg: &Config, mcp_config: &str, resume: bool, effort: Option<Effort>
         "stream-json",
         "--output-format",
         "stream-json",
-        // Whole messages only. Token-by-token deltas (`--include-partial-messages`) would
-        // multiply the frames sent to the Durable Object, and nothing shows them yet.
         "--verbose",
+        // The model's response piece by piece as well, on `stream_event` lines. The text
+        // being written is shown from those; they are not passed on one by one, see
+        // `piece`.
+        "--include-partial-messages",
         // Echoes each user message back when Claude picks it up; see `is_replay_of`.
         "--replay-user-messages",
         // Edits inside the working directory need no prompt; everything not covered by
@@ -248,6 +250,40 @@ pub fn is_replay_of(line: &Value, uuid: &str) -> bool {
     line["type"] == "user" && line["isReplay"] == true && line["uuid"] == uuid
 }
 
+/// What a piece of the model's response means for the text Claude is writing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Piece<'a> {
+    /// A new text begins, so whatever was being written before is finished.
+    Begin,
+    /// More of the text.
+    More(&'a str),
+}
+
+/// Whether `line` is a piece of a response on its way in, which Claude prints for every
+/// event of the model's stream, and not a whole message. A long answer comes in thousands
+/// of them, and a file being written comes twice: in pieces and then as the tool call.
+pub fn is_stream_event(line: &Value) -> bool {
+    line["type"] == "stream_event"
+}
+
+/// Reads such a line, which wraps the model's event in `event`. `None` for all that is
+/// not text of the agent's own: thinking, the input of a tool call, and anything a
+/// sub-agent writes, which is never the answer.
+pub fn piece(line: &Value) -> Option<Piece<'_>> {
+    if !line["parent_tool_use_id"].is_null() {
+        return None;
+    }
+    let event = &line["event"];
+    match event["type"].as_str()? {
+        "message_start" => Some(Piece::Begin),
+        "content_block_start" if event["content_block"]["type"] == "text" => Some(Piece::Begin),
+        "content_block_delta" if event["delta"]["type"] == "text_delta" => {
+            event["delta"]["text"].as_str().map(Piece::More)
+        }
+        _ => None,
+    }
+}
+
 /// Why Claude did not do what a control request asked, if `line` is its answer to one and
 /// says so. The only such request is the one in [`Claude::set_effort`], and a CLI that
 /// stopped taking it would otherwise go on at the old level without a word.
@@ -310,4 +346,45 @@ async fn read_output(mut child: Child, generation: u64, events: mpsc::UnboundedS
         format!("claude exited: {status}\n{stderr}")
     };
     let _ = events.send(ChildEvent::Exited { generation, detail });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stream_event(event: Value, parent: Value) -> Value {
+        json!({ "type": "stream_event", "event": event, "parent_tool_use_id": parent })
+    }
+
+    fn delta(delta: Value) -> Value {
+        json!({ "type": "content_block_delta", "index": 0, "delta": delta })
+    }
+
+    #[test]
+    fn only_the_agents_own_text_counts_as_what_it_is_writing() {
+        let text = delta(json!({ "type": "text_delta", "text": "Here " }));
+        let own = stream_event(text.clone(), Value::Null);
+        assert!(is_stream_event(&own));
+        assert_eq!(piece(&own), Some(Piece::More("Here ")));
+        // The same from a sub-agent, whose text ends up in a tool result.
+        assert_eq!(piece(&stream_event(text, json!("toolu_1"))), None);
+
+        let thinking = delta(json!({ "type": "thinking_delta", "thinking": "hm" }));
+        assert_eq!(piece(&stream_event(thinking, Value::Null)), None);
+        let input = delta(json!({ "type": "input_json_delta", "partial_json": "{" }));
+        assert_eq!(piece(&stream_event(input, Value::Null)), None);
+
+        let start = |block: &str| {
+            let start =
+                json!({ "type": "content_block_start", "content_block": { "type": block } });
+            stream_event(start, Value::Null)
+        };
+        assert_eq!(piece(&start("text")), Some(Piece::Begin));
+        assert_eq!(piece(&start("tool_use")), None);
+        let message = stream_event(json!({ "type": "message_start" }), Value::Null);
+        assert_eq!(piece(&message), Some(Piece::Begin));
+
+        let whole = json!({ "type": "assistant", "message": { "content": [] } });
+        assert!(!is_stream_event(&whole));
+    }
 }
