@@ -86,9 +86,9 @@ With Guest Mode switched on for the bot in @BotFather, someone on the allow-list
 - **What the agent is given.** The message without the mention it starts with, and ahead of it the message it replies to, quoted, since that is usually what the question is about ("@bot summarise this"). A line in front tells the agent that its answer has to fit in one message.
 - **One message.** The reply starts as "Working…" and shows the turn's progress. A permission prompt or a clarifying question takes its place, with its buttons, until it is answered, and several prompts are shown one after the other. Everyone in the chat sees what is asked for; only the person who summoned the bot can answer, and anyone else who presses is told so. At the end the answer replaces all of it. An answer too long for one message is cut there and says so, and a request too long to show whole in a prompt is declined, because the file it would be attached as cannot be sent.
 - **Files.** A file written to `/work/out/` goes to the private chat of the person who asked, and the reply says that it did. Telegram lets a bot write only to people who have opened a chat with it, so for anyone else the reply says that the file could not be sent.
-- **Commands.** They are sent like anything else, in a message that mentions the bot: `@your_bot /new`, `/stop`, `/status`, `/effort high`. `/resume` and `/rewind` work only in a chat with the bot itself. Their lists are buttons, and a button on a guest's reply has to carry the chat it is in, which leaves no room for what those buttons carry.
+- **Commands.** They are sent like anything else, in a message that mentions the bot: `@your_bot /new`, `/resume`, `/rewind`, `/stop`, `/status`, `/effort high`. The lists of `/resume` and `/rewind` are the reply to that message, and it turns into what was picked. They call each message by what the person wrote, without the quoted message and the line for the agent. Anyone in the chat can press such a list, and only the person it was made for gets anywhere: the others are told so. `/effort` on its own names the levels to send and has no buttons, because a level is a setting anyone's session takes, so a press by someone else would have closed the list with a level that person set for themselves.
 
-A press on a guest's button reaches the Worker without the chat it happened in. The button's data names the chat for that reason, and the session is found from it and from who pressed.
+A press on a guest's button reaches the Worker without the chat it happened in. The button's data names the chat for that reason, and the session is found from it and from who pressed. That costs up to 18 of the 64 bytes a button has, so a `/rewind` button names its conversation by the first 8 characters of the id, which is enough to tell a list of the conversation the chat is in from an older one.
 
 ## Develop
 
@@ -269,5 +269,5 @@ Check as well that `claude --help` still lists the levels of `Effort` in `crates
 - Locking containers down to the Worker only (`enableInternet: false` with outbound interception).
 - Sending a file from an agent to the MCP server. Files only travel the other way.
 - Letting a container sleep while a prompt waits (`defer`), and filesystem snapshots instead of the tar archive.
-- `/resume` and `/rewind` for a guest, and one daily budget for a person across the chats they summon the bot in.
+- One daily budget for a person across the chats they summon the bot in.
 - Drafts in the topics of a private chat. A draft is shown without a topic.

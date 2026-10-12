@@ -97,12 +97,11 @@ const GUEST_HELP: &str = "Mention me with what you want, or reply to one of my m
     and I'll answer here in one message. What you ask me in this chat is a conversation of \
     your own.\n\n\
     /new — start a fresh conversation\n\
+    /resume — go back to an earlier conversation\n\
+    /rewind — go back to before one of your messages\n\
     /effort — how much work I put into an answer\n\
     /stop — stop what I'm doing\n\
     /status — what I'm doing and today's usage";
-/// For the commands that end in a list to pick from, which a guest cannot offer: the
-/// buttons of `/resume` and `/rewind` have no room left to name the chat they are in.
-const CHAT_ONLY: &str = "That works only in a chat with me directly.";
 /// For a press that finds nothing to answer in a chat the bot is in, and where it is a
 /// guest. There the press may also be someone else's than the user's who was asked.
 const GONE: &str = "This is no longer open.";
@@ -676,7 +675,6 @@ impl Inner {
         let (reply, keyboard) = match command {
             "/start" | "/help" => (help.to_owned(), None),
             "/new" => (self.reset().await?, None),
-            "/resume" | "/rewind" if guest => (CHAT_ONLY.to_owned(), None),
             "/resume" => self.offer_resume()?,
             "/rewind" => self.offer_rewind()?,
             "/effort" => self.on_effort(text.split_whitespace().nth(1)),
@@ -810,12 +808,7 @@ impl Inner {
             })
             .await?;
         self.discard(unkept).await;
-        let done = if self.is_guest() {
-            "Started a fresh conversation."
-        } else {
-            "Started a fresh conversation. /resume goes back to an earlier one."
-        };
-        Ok(done.into())
+        Ok("Started a fresh conversation. /resume goes back to an earlier one.".into())
     }
 
     // ----- Earlier conversations, and earlier points in this one -----
@@ -893,9 +886,14 @@ impl Inner {
             } => self.rewind(conversation, *checkpoint).await?,
         };
         let Some(html) = done else {
-            return bot
-                .answer_callback(&query.id, Some("This is no longer open."))
-                .await;
+            // A guest's list can be pressed by anyone in the chat. Their press leads to
+            // a session of their own, which has none of the listed things.
+            let gone = if query.message.is_none() {
+                GUEST_GONE
+            } else {
+                GONE
+            };
+            return bot.answer_callback(&query.id, Some(gone)).await;
         };
         self.close_list(bot, query, &html).await
     }
@@ -903,12 +901,14 @@ impl Inner {
     /// Turns a list into the record of what was picked from it.
     async fn close_list(&self, bot: &Bot, query: &CallbackQuery, html: &str) -> Result<()> {
         let _ = bot.answer_callback(&query.id, None).await;
-        match &query.message {
-            Some(list) => {
+        match (&query.message, &query.inline_message_id) {
+            (Some(list), _) => {
                 bot.edit_message(self.chat_id(), list.message_id, html, None)
                     .await
             }
-            None => bot.send_message(self.chat_id(), html, None).await.map(drop),
+            // A guest's list is the reply its summons got.
+            (None, Some(reply)) => bot.edit_guest_reply(reply, html, None).await,
+            (None, None) => bot.send_message(self.chat_id(), html, None).await.map(drop),
         }
     }
 
@@ -972,14 +972,19 @@ impl Inner {
 
     /// Takes the conversation back to before the turn that `checkpoint` was saved after.
     /// Returns what to say, or `None` if the list the press came from is out of date.
-    async fn rewind(&self, conversation: &str, checkpoint: u64) -> Result<Option<String>> {
-        let name = {
+    ///
+    /// `picked` is the conversation as the button names it, which is by the start of its
+    /// id; see [`render::conversation_tag`].
+    async fn rewind(&self, picked: &str, checkpoint: u64) -> Result<Option<String>> {
+        let (name, conversation) = {
             let session = self.session.borrow();
-            if session.claude_session_id != conversation {
+            let current = render::conversation_tag(&session.claude_session_id);
+            if current != render::conversation_tag(picked) {
                 return Ok(None);
             }
-            session.name.clone()
+            (session.name.clone(), session.claude_session_id.clone())
         };
+        let conversation = conversation.as_str();
         let kept = self.store.checkpoints(conversation)?;
         let Some((undone, Some(parent))) = render::rewindable(&kept)
             .into_iter()

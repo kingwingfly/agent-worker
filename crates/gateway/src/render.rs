@@ -26,6 +26,11 @@ const NOTES_BUDGET: usize = 1000;
 const GUEST_PREFIX: char = 'g';
 /// Goes at the end of an answer that went on past the one message a guest gets.
 const CUT: &str = "✂️ <i>The rest did not fit: where I am a guest, I get one message.</i>";
+/// How much of a conversation's id a button of the `/rewind` list carries. On a guest's
+/// reply the button names its chat as well, and the whole id would not fit beside that.
+const CONVERSATION_TAG_CHARS: usize = 8;
+/// Starts the line that says which message a guest's summons replies to.
+const REPLIES_TO: &str = "[It replies to this message";
 /// Goes ahead of what a guest is asked. The agent cannot tell from anything else that
 /// this turn's answer is cut after one message.
 const GUEST_NOTE: &str = "[Sent from a chat where you are a guest. Your reply must be a \
@@ -373,7 +378,8 @@ pub fn without_mentions(text: &str) -> &str {
 pub fn guest_request(text: &str, replied: Option<(Option<&str>, &str)>) -> String {
     let mut request = String::from(GUEST_NOTE);
     if let Some((author, words)) = replied {
-        request.push_str("\n\n[It replies to this message");
+        request.push_str("\n\n");
+        request.push_str(REPLIES_TO);
         if let Some(author) = author {
             request.push_str(&format!(" from {author}"));
         }
@@ -388,6 +394,33 @@ pub fn guest_request(text: &str, replied: Option<(Option<&str>, &str)>) -> Strin
         request.push_str(text);
     }
     request
+}
+
+/// What the user wrote, out of a message as a turn was given it. A guest's turn is given
+/// more, see [`guest_request`]: a line for the agent and the message that was replied
+/// to. Neither is what the lists of `/resume` and `/rewind` should call the message by.
+/// A summons that said nothing itself is called by the message it replied to.
+fn asked(request: &str) -> String {
+    let Some(rest) = request.strip_prefix(GUEST_NOTE) else {
+        return request.to_owned();
+    };
+    let rest = rest.trim_start_matches('\n');
+    let Some(reply) = rest.strip_prefix(REPLIES_TO) else {
+        return rest.to_owned();
+    };
+    // The rest of the line that says whose message it is, that message line by line,
+    // an empty line, and then the user's own words.
+    let mut lines = reply.lines().skip(1);
+    let quoted: Vec<&str> = lines
+        .by_ref()
+        .map_while(|line| line.strip_prefix("> "))
+        .collect();
+    let words = lines.collect::<Vec<_>>().join("\n");
+    if words.is_empty() {
+        quoted.join("\n")
+    } else {
+        words
+    }
 }
 
 /// Removes tags but leaves entities, so the result is still valid HTML text.
@@ -743,17 +776,27 @@ pub fn answered_questions(input: &Value, answers: &serde_json::Map<String, Value
 }
 
 /// A pressed button of the `/resume` or `/rewind` list. Like [`Callback`], it has to fit
-/// in 64 bytes: a conversation's id is a UUID and a checkpoint is named by a time in
-/// milliseconds.
+/// in 64 bytes, and on a guest's reply in what [`for_guest`] leaves of them: a
+/// conversation's id is a UUID and a checkpoint is named by a time in milliseconds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Pick {
     /// Go on with this conversation.
     Resume { conversation: String },
     /// Take the conversation back to before the turn this checkpoint was saved after.
+    /// The conversation is named by its [`conversation_tag`], and by its whole id on a
+    /// button from before there were tags.
     Rewind {
         conversation: String,
         checkpoint: u64,
     },
+}
+
+/// The start of a conversation's id, by which a `/rewind` button says what it is a list
+/// of. It only has to tell the chat's conversations apart, of which few are kept, so
+/// that a list from before `/new` or `/resume` is not taken for one of the conversation
+/// the chat is in now.
+pub fn conversation_tag(id: &str) -> &str {
+    id.get(..CONVERSATION_TAG_CHARS).unwrap_or(id)
 }
 
 impl Pick {
@@ -794,7 +837,7 @@ fn ago(now_ms: u64, then_ms: u64) -> String {
 
 /// One row of a list: the start of a message, on one line, and its age.
 fn pick_row(text: &str, then_ms: u64, now_ms: u64, pick: Pick) -> Value {
-    let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let one_line = asked(text).split_whitespace().collect::<Vec<_>>().join(" ");
     let label = format!(
         "{} · {}",
         truncate(&one_line, PICK_LABEL_CHARS),
@@ -830,12 +873,12 @@ pub fn resume_picker(
 pub fn resumed(conversation: &Conversation, last: Option<&str>) -> String {
     let mut html = format!(
         "💬 <b>Resumed</b>\n<i>{}</i>",
-        escape(&truncate(&conversation.title, PICKED_TEXT_LIMIT))
+        escape(&truncate(&asked(&conversation.title), PICKED_TEXT_LIMIT))
     );
     if let Some(last) = last.filter(|last| *last != conversation.title) {
         html.push_str(&format!(
             "\n\nYour last message in it:\n<pre>{}</pre>",
-            escape(&truncate(last, PICKED_TEXT_LIMIT))
+            escape(&truncate(&asked(last), PICKED_TEXT_LIMIT))
         ));
     }
     html
@@ -866,7 +909,7 @@ pub fn rewind_picker(
         .into_iter()
         .map(|checkpoint| {
             let pick = Pick::Rewind {
-                conversation: conversation.to_owned(),
+                conversation: conversation_tag(conversation).to_owned(),
                 checkpoint: checkpoint.at_ms,
             };
             pick_row(&checkpoint.text, checkpoint.at_ms, now_ms, pick)
@@ -884,7 +927,7 @@ pub fn rewound(text: &str) -> String {
     format!(
         "⏪ <b>Rewound</b>\nThe conversation and the files are as they were before this \
          message:\n<pre>{}</pre>\nSend it again, or something else.",
-        escape(&truncate(text, PICKED_TEXT_LIMIT))
+        escape(&truncate(&asked(text), PICKED_TEXT_LIMIT))
     )
 }
 
@@ -1159,6 +1202,102 @@ mod tests {
         assert_eq!(rewindable(&short).len(), 2);
         assert!(rewindable(&[checkpoint(100, None, "after an old state")]).is_empty());
         assert_eq!(rewind_picker("c", &kept[2..], 500), None);
+    }
+
+    #[test]
+    fn a_guests_lists_fit_their_buttons_and_call_messages_by_what_was_written() {
+        let current = "0b0e7f0a-52a5-4b56-9f6f-6f1e8f0c2a11";
+        let other = "7c1d2e3f-0000-4b56-9f6f-6f1e8f0c2a11";
+        // What a guest's turns are given, which is more than the user wrote.
+        let plain = guest_request("what is the plan?\nAnd who pays?", None);
+        let reply = guest_request(
+            "summarise this",
+            Some((Some("Bea"), "It rained.\n\nAll week.")),
+        );
+        let bare = guest_request("", Some((None, "It rained.\nAll week.")));
+        let kept = [
+            checkpoint(9_999_999_999_999, Some(9_999_999_879_999), &bare),
+            checkpoint(9_999_999_879_999, Some(9_999_992_799_999), &reply),
+            checkpoint(9_999_992_799_999, Some(0), &plain),
+        ];
+        let (_, rewind) = rewind_picker(current, &kept, 9_999_999_999_999).expect("a list");
+        let saved = [Conversation {
+            id: other.into(),
+            title: reply.clone(),
+            used_ms: 0,
+            head: 1,
+        }];
+        let (_, resume) = resume_picker(&saved, current, 60_000).expect("a list");
+
+        let texts = |keyboard: &Value| -> Vec<String> {
+            let rows = keyboard["inline_keyboard"].as_array().unwrap();
+            rows.iter()
+                .map(|row| row[0]["text"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        assert_eq!(
+            texts(&rewind),
+            [
+                "It rained. All week. · just now",
+                "summarise this · 2 min ago",
+                "what is the plan? And who pays? · 2 h ago",
+            ]
+        );
+        assert_eq!(texts(&resume), ["summarise this · 1 min ago"]);
+        assert_eq!(
+            rewound(&reply),
+            "⏪ <b>Rewound</b>\nThe conversation and the files are as they were before this \
+             message:\n<pre>summarise this</pre>\nSend it again, or something else."
+        );
+        assert_eq!(
+            resumed(&saved[0], Some(&plain)),
+            "💬 <b>Resumed</b>\n<i>summarise this</i>\n\n\
+             Your last message in it:\n<pre>what is the plan?\nAnd who pays?</pre>"
+        );
+        // A message of a chat the bot is in is what it always was.
+        assert_eq!(
+            asked("[It replies to this message"),
+            "[It replies to this message"
+        );
+
+        // With the longest ids there are, every button still names its chat, and what
+        // is left of its data says the same as on a list in a chat.
+        for chat_id in [-1_009_999_999_999, 4_503_599_627_370_495] {
+            for keyboard in [&rewind, &resume] {
+                let guest = for_guest(keyboard.clone(), chat_id);
+                for (row, plain) in guest["inline_keyboard"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .zip(keyboard["inline_keyboard"].as_array().unwrap())
+                {
+                    let data = row[0]["callback_data"].as_str().unwrap();
+                    assert!(data.len() <= 64, "{data}");
+                    let (named, rest) = guest_chat(data).expect("a guest's button");
+                    assert_eq!(named, chat_id);
+                    assert_eq!(rest, plain[0]["callback_data"].as_str().unwrap());
+                    assert!(Pick::parse(rest).is_some());
+                }
+            }
+        }
+        let pressed = Pick::parse(
+            rewind["inline_keyboard"][0][0]["callback_data"]
+                .as_str()
+                .unwrap(),
+        );
+        assert_eq!(
+            pressed,
+            Some(Pick::Rewind {
+                conversation: "0b0e7f0a".into(),
+                checkpoint: 9_999_999_999_999,
+            })
+        );
+        // The list is told from one of another conversation, and a button from before
+        // ids were cut short still says which conversation it is of.
+        assert_eq!(conversation_tag(current), "0b0e7f0a");
+        assert_eq!(conversation_tag("0b0e7f0a"), conversation_tag(current));
+        assert_ne!(conversation_tag(other), conversation_tag(current));
+        assert_eq!(conversation_tag(""), "");
     }
 
     #[test]
