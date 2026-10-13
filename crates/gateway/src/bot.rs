@@ -9,7 +9,7 @@ use worker::{Delay, Fetch, Headers, Method, Request, RequestInit, Result, js_sys
 use crate::{
     config::Config,
     platform::{error, random_uuid},
-    render, scrub,
+    render, scrub, update,
 };
 
 const RATE_LIMIT_RETRIES: u32 = 2;
@@ -69,7 +69,13 @@ impl Bot {
                     waits += 1;
                     Delay::from(Duration::from_secs(seconds + 1)).await;
                 }
-                _ => {
+                // A wait too long to sit out is the caller's to act on. It is put into
+                // the error from the figure, not from the description beside it.
+                Some(seconds) => {
+                    let refusal = update::too_many_requests(seconds);
+                    return Err(error(format!("telegram {method}: {refusal}")));
+                }
+                None => {
                     let description = reply["description"].as_str().unwrap_or("unknown error");
                     return Err(error(format!("telegram {method}: {description}")));
                 }
@@ -230,7 +236,7 @@ impl Bot {
             // Only what Telegram said counts as a refusal. A request that did not get
             // there says nothing about the next one.
             Err(worker::Error::RustError(said))
-                if !said.contains(UNPARSED) && !said.contains("Too Many Requests") =>
+                if !said.contains(UNPARSED) && !said.contains(update::TOO_MANY) =>
             {
                 Err(error(said))
             }
