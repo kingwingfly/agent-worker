@@ -1510,7 +1510,14 @@ impl Inner {
         // shown is answered for the user, and a finished turn is closed whatever part of
         // reporting it failed. So the frame counts as done either way.
         let streamed = matches!(frame, FromRunner::Event { .. });
+        let runner = self.session.borrow().control_secret.clone();
         self.handle(frame).await;
+        // A container started while that took its time counts its frames from one
+        // again. This frame's number says nothing about those: recorded, it would have
+        // every frame of the new runner up to that number taken for one seen before.
+        if self.session.borrow().control_secret != runner {
+            return;
+        }
         self.session.borrow_mut().last_seq = seq;
         let due = {
             let mut live = self.live.borrow_mut();
