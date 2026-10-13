@@ -39,9 +39,11 @@ pub fn export(cfg: &Config) -> anyhow::Result<NamedTempFile> {
     archive.follow_symlinks(false);
     for (prefix, dir) in roots(cfg) {
         if dir.is_dir() {
-            archive
-                .append_dir_all(prefix, &dir)
+            let left_out = pack(&mut archive, prefix, &dir)
                 .with_context(|| format!("archiving {}", dir.display()))?;
+            for path in left_out {
+                tracing::warn!(path = %path.display(), "left out of the saved state");
+            }
         }
     }
     archive.into_inner()?.finish()?.flush()?;
@@ -53,6 +55,73 @@ pub fn export(cfg: &Config) -> anyhow::Result<NamedTempFile> {
         cfg.state_max_bytes
     );
     Ok(file)
+}
+
+/// Adds `dir` and all that is in it to `archive`, as `name`. Returns what was left out:
+/// whatever is not a file, a directory or a link, and what cannot be read.
+///
+/// The agent runs what it likes in its working directory, and a program can leave a
+/// socket there, or a file closed to its own user. An archive has no entry for the
+/// first and the second cannot be opened. One such thing must not cost the conversation
+/// its checkpoint, turn after turn for as long as it is there: the next container does
+/// without it, as it does without the program that left it.
+fn pack<W: Write>(
+    archive: &mut tar::Builder<W>,
+    name: &str,
+    dir: &Path,
+) -> io::Result<Vec<PathBuf>> {
+    let mut left_out = Vec::new();
+    archive.append_dir(name, dir)?;
+    let mut dirs = vec![(PathBuf::from(name), dir.to_path_buf())];
+    while let Some((name, dir)) = dirs.pop() {
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) => {
+                if !gone(&error) {
+                    left_out.push(dir);
+                }
+                continue;
+            }
+        };
+        for entry in entries.flatten() {
+            let (name, path) = (name.join(entry.file_name()), entry.path());
+            // Of the entry itself: a link is kept as the link it is.
+            let Ok(kind) = entry.file_type() else {
+                left_out.push(path);
+                continue;
+            };
+            let added = if kind.is_dir() {
+                archive
+                    .append_dir(&name, &path)
+                    .map(|()| dirs.push((name, path)))
+            } else if kind.is_symlink() {
+                archive.append_path_with_name(&path, &name)
+            } else if kind.is_file() {
+                match File::open(&path) {
+                    Ok(mut file) => archive.append_file(&name, &mut file),
+                    Err(error) if gone(&error) => Ok(()),
+                    Err(_) => {
+                        left_out.push(path);
+                        Ok(())
+                    }
+                }
+            } else {
+                left_out.push(path);
+                Ok(())
+            };
+            match added {
+                Err(error) if !gone(&error) => return Err(error),
+                _ => {}
+            }
+        }
+    }
+    Ok(left_out)
+}
+
+/// Whether `error` says that something is not there. What a program still running took
+/// away again between being listed and being read is not there to keep.
+fn gone(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::NotFound
 }
 
 /// Unpacks an archive made by [`export`] into the persistent directories. Blocking.
@@ -196,6 +265,62 @@ mod tests {
         assert!(resolve_artifact(&out, "../secret").is_none());
         assert!(resolve_artifact(&out, "link").is_none());
         assert!(resolve_artifact(&out, "missing").is_none());
+    }
+
+    #[test]
+    fn packing_leaves_out_what_an_archive_cannot_hold() {
+        use std::os::unix::{
+            fs::{PermissionsExt, symlink},
+            net::UnixListener,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        fs::create_dir_all(work.join("sub")).unwrap();
+        fs::write(work.join("notes.md"), b"kept").unwrap();
+        fs::write(work.join("sub/deep.txt"), b"kept too").unwrap();
+        symlink("notes.md", work.join("link")).unwrap();
+        // What a program the agent ran can leave behind: a socket it listened on, and a
+        // file that not even its owner may read.
+        let _socket = UnixListener::bind(work.join("sub/agent.sock")).unwrap();
+        let closed = work.join("closed");
+        fs::write(&closed, b"x").unwrap();
+        fs::set_permissions(&closed, fs::Permissions::from_mode(0o000)).unwrap();
+        // Nothing is closed to root, which keeps the file then.
+        let readable = File::open(&closed).is_ok();
+
+        let mut archive = tar::Builder::new(Vec::new());
+        archive.follow_symlinks(false);
+        let mut left_out = pack(&mut archive, "work", &work).unwrap();
+        left_out.sort();
+        let mut expected = vec![work.join("sub/agent.sock")];
+        if !readable {
+            expected.insert(0, closed);
+        }
+        assert_eq!(left_out, expected);
+
+        let bytes = archive.into_inner().unwrap();
+        let mut packed = tar::Archive::new(bytes.as_slice());
+        let mut names: Vec<String> = packed
+            .entries()
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path().unwrap().display().to_string();
+                path.trim_end_matches('/').to_owned()
+            })
+            .filter(|name| name != "work/closed")
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "work",
+                "work/link",
+                "work/notes.md",
+                "work/sub",
+                "work/sub/deep.txt"
+            ]
+        );
     }
 
     #[test]
