@@ -111,8 +111,18 @@ const GUEST_HELP: &str = "Mention me with what you want, or reply to one of my m
     /status — what I'm doing and today's usage";
 /// For a press that finds nothing to answer in a chat the bot is in, and where it is a
 /// guest. There the press may also be someone else's than the user's who was asked.
-const GONE: &str = "This is no longer open.";
+pub const GONE: &str = "This is no longer open.";
 const GUEST_GONE: &str = "Only whoever asked me can answer this, while it is open.";
+
+/// What a press that finds nothing to answer is told. A button without a message is on
+/// a guest's reply.
+fn gone(query: &CallbackQuery) -> &'static str {
+    if query.message.is_none() {
+        GUEST_GONE
+    } else {
+        GONE
+    }
+}
 
 /// Where what the bot says to one incoming message goes.
 enum Reply<'a> {
@@ -945,12 +955,7 @@ impl Inner {
         let Some(html) = done else {
             // A guest's list can be pressed by anyone in the chat. Their press leads to
             // a session of their own, which has none of the listed things.
-            let gone = if query.message.is_none() {
-                GUEST_GONE
-            } else {
-                GONE
-            };
-            return bot.answer_callback(&query.id, Some(gone)).await;
+            return bot.answer_callback(&query.id, Some(gone(query))).await;
         };
         self.close_list(bot, query, &html).await
     }
@@ -1964,12 +1969,7 @@ impl Inner {
         // here. It gets to a session of their own, which has no such prompt.
         let guest = self.is_guest();
         let (Some(callback), Some(mut approval)) = (callback, approval) else {
-            let gone = if query.message.is_none() {
-                GUEST_GONE
-            } else {
-                GONE
-            };
-            return bot.answer_callback(&query.id, Some(gone)).await;
+            return bot.answer_callback(&query.id, Some(gone(&query))).await;
         };
         let chat_id = self.chat_id();
 

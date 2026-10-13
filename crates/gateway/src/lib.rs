@@ -33,7 +33,7 @@ use worker::{
 use crate::{
     bot::Bot,
     config::Config,
-    session::{NAME_HEADER, SESSION_BINDING, UPDATE_PATH},
+    session::{GONE, NAME_HEADER, SESSION_BINDING, UPDATE_PATH},
     update::Update,
 };
 
@@ -85,8 +85,7 @@ async fn telegram(mut request: Request, env: &Env, cfg: &Config) -> Result<Respo
     let Some(origin) = update.origin() else {
         // A button nothing is known about still shows as pressed until it is answered.
         if let Some(query) = &update.callback_query {
-            let gone = Some("This is no longer open.");
-            let _ = Bot::new(cfg).answer_callback(&query.id, gone).await;
+            let _ = Bot::new(cfg).answer_callback(&query.id, Some(GONE)).await;
         }
         return Response::empty();
     };
