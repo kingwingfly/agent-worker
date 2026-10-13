@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from importlib.machinery import SourceFileLoader
 from importlib.util import module_from_spec, spec_from_loader
@@ -50,6 +51,21 @@ case $MODE in
 esac
 printf '%%PDF-1.4 a page' > "$pdf"
 """
+
+
+def running(group):
+    """The processes of a group that have not ended. One that has ended stays in the
+    table until its parent collects it, and where nothing does, as in a container that
+    has no init, it stays for good: asking the kernel for the group would find it."""
+    found = []
+    for stat in Path("/proc").glob("[0-9]*/stat"):
+        try:
+            state, _, its_group = stat.read_text().rpartition(")")[2].split()[:3]
+        except OSError:
+            continue
+        if int(its_group) == group and state != "Z":
+            found.append(stat.parent.name)
+    return found
 
 
 def body(text, folder=Path("/nonexistent"), scratch=Path("/nonexistent"), allowed=md2pdf.EACH):
@@ -612,9 +628,13 @@ class TheCommand(unittest.TestCase):
                 md2pdf.print_pdf(self.work / "document.html", self.work / "document.pdf", self.work)
         # It was tried without the sandbox as well, and nothing of either try is left.
         self.assertIn("--no-sandbox", self.arguments())
+        # They were killed, which takes a moment to show.
         group = int((self.work / "bin" / "pid").read_text())
-        with self.assertRaises(ProcessLookupError):
-            os.killpg(group, 0)
+        for _ in range(100):
+            if not running(group):
+                break
+            time.sleep(0.05)
+        self.assertEqual(running(group), [])
 
     @unittest.skipUnless(
         any(shutil.which(name) for name in md2pdf.BROWSERS) and shutil.which("pdftotext"),
