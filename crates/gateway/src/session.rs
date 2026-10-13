@@ -378,6 +378,10 @@ struct Live {
     unacked_events: u32,
     /// The chat is being moved to another conversation, or to another point in this one.
     switching: bool,
+    /// The turn whose end is being reported, by its id. That takes a while, and the turn
+    /// stays open for as long, so that no other begins. For the runner it is over: it
+    /// is not handed over again, and being told once more that it ended changes nothing.
+    reporting: Option<String>,
 }
 
 struct Inner {
@@ -499,6 +503,18 @@ impl Inner {
 
     fn turn(&self) -> Option<Turn> {
         self.session.borrow().turn.clone()
+    }
+
+    /// Whether the end of `turn` is being reported, see [`Live::reporting`].
+    fn reporting(&self, turn: &Turn) -> bool {
+        self.live.borrow().reporting.as_deref() == Some(turn.id.as_str())
+    }
+
+    /// The open turn, while it is the runner's to work on. One whose end is being
+    /// reported is not: handed over again, to a container started in place of one that
+    /// went away in the meantime, it would be run a second time.
+    fn turn_to_drive(&self) -> Option<Turn> {
+        self.turn().filter(|turn| !self.reporting(turn))
     }
 
     fn chat_id(&self) -> i64 {
@@ -1216,7 +1232,7 @@ impl Inner {
     }
 
     async fn drive_once(self: &Rc<Self>) -> Result<()> {
-        if self.turn().is_none() {
+        if self.turn_to_drive().is_none() {
             return Ok(());
         }
         let cfg = self.cfg()?;
@@ -1230,9 +1246,10 @@ impl Inner {
             self.establish(&cfg, &host).await?;
         }
 
-        // Read the turn again: `/stop` may have ended it during the awaits above. From
-        // here to the end nothing awaits, so the turn cannot change under this either.
-        let Some(turn) = self.turn() else {
+        // Read the turn again: `/stop` may have ended it during the awaits above, or the
+        // runner may have. From here to the end nothing awaits, so the turn cannot
+        // change under this either.
+        let Some(turn) = self.turn_to_drive() else {
             return Ok(());
         };
         // The runner ignores a turn it already has, so repeating this is harmless.
@@ -1476,6 +1493,16 @@ impl Inner {
             frame => frame.seq().unwrap_or_default(),
         };
         if seq <= self.session.borrow().last_seq {
+            return;
+        }
+        // A frame counts as seen once it has been handled, and the end of a turn takes
+        // a while to handle. A connection made anew in that time has the runner say
+        // again that the turn is over. The report under way answers for that frame, and
+        // acknowledges it when it is through: doing it twice would send the answer and
+        // the files twice.
+        if let FromRunner::TurnDone { turn_id, .. } = &frame
+            && self.live.borrow().reporting.as_deref() == Some(turn_id.as_str())
+        {
             return;
         }
 
@@ -2120,6 +2147,8 @@ impl Inner {
 
     async fn finish_turn(&self, result: TurnResult) {
         let Some(turn) = self.turn() else { return };
+        // From here to the end the turn is open and over at once, see `Live::reporting`.
+        self.live.borrow_mut().reporting = Some(turn.id.clone());
         let idle_ttl_ms = match self.cfg() {
             Ok(cfg) => {
                 self.report_turn(&cfg, &turn, &result).await;
@@ -2131,8 +2160,14 @@ impl Inner {
             }
         };
         // Only now may the next message start a turn: the files had to be read while
-        // nothing was changing them.
-        self.close_turn(idle_ttl_ms).await;
+        // nothing was changing them. A turn the alarm gave up on meanwhile is closed
+        // already, and the one that is open by now, if any, is another.
+        if self.turn().is_some_and(|open| open.id == turn.id) {
+            self.close_turn(idle_ttl_ms).await;
+        }
+        if self.reporting(&turn) {
+            self.live.borrow_mut().reporting = None;
+        }
     }
 
     /// Everything owed to the user when a turn ends. Each part is attempted whatever
