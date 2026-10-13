@@ -1,6 +1,6 @@
 //! The `claude` child process: how it is launched and how its stream-json output is read.
 
-use std::{collections::VecDeque, path::PathBuf, process::Stdio, sync::Arc};
+use std::{collections::VecDeque, path::PathBuf, process::Stdio};
 
 use agent_proto::Effort;
 use anyhow::Context;
@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, Command},
-    sync::{Mutex, mpsc},
+    sync::mpsc,
 };
 
 use crate::config::Config;
@@ -299,20 +299,19 @@ async fn read_output(mut child: Child, generation: u64, events: mpsc::UnboundedS
     let stdout = child.stdout.take().expect("stdout is piped");
     let stderr = child.stderr.take().expect("stderr is piped");
 
-    let tail = Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL_LINES)));
-    let stderr_task = tokio::spawn({
-        let tail = tail.clone();
-        async move {
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                tracing::debug!(target: "claude::stderr", "{line}");
-                let mut tail = tail.lock().await;
-                if tail.len() == STDERR_TAIL_LINES {
-                    tail.pop_front();
-                }
-                tail.push_back(line);
+    // Read beside stdout, so that the process is never held up by a pipe nobody empties.
+    // The task ends with the last lines, which say why a process that died did.
+    let stderr_task = tokio::spawn(async move {
+        let mut tail = VecDeque::with_capacity(STDERR_TAIL_LINES);
+        let mut lines = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            tracing::debug!(target: "claude::stderr", "{line}");
+            if tail.len() == STDERR_TAIL_LINES {
+                tail.pop_front();
             }
+            tail.push_back(line);
         }
+        tail
     });
 
     let mut lines = BufReader::new(stdout).lines();
@@ -338,8 +337,7 @@ async fn read_output(mut child: Child, generation: u64, events: mpsc::UnboundedS
         Ok(status) => status.to_string(),
         Err(error) => format!("unknown ({error})"),
     };
-    let _ = stderr_task.await;
-    let stderr = Vec::from(std::mem::take(&mut *tail.lock().await)).join("\n");
+    let stderr = Vec::from(stderr_task.await.unwrap_or_default()).join("\n");
     let detail = if stderr.is_empty() {
         format!("claude exited: {status}")
     } else {
