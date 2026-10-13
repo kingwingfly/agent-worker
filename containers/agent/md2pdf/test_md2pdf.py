@@ -48,6 +48,7 @@ case $MODE in
   fails) echo "chromium is unwell" >&2; exit 1 ;;
   half) printf '%%PDF-half' > "$pdf"; exit 1 ;;
   hangs) sleep 600 & sleep 600 ;;
+  lingers) (sleep 600 &) ;;
 esac
 printf '%%PDF-1.4 a page' > "$pdf"
 """
@@ -620,21 +621,43 @@ class TheCommand(unittest.TestCase):
         self.assertEqual(done.returncode, 1)
         self.assertIn("md2pdf: no such file: missing.md", done.stderr)
 
-    def test_a_chromium_that_never_finishes_is_ended_with_all_it_started(self):
-        with mock.patch.dict(os.environ, dict(self.environment, MODE="hangs")), mock.patch.object(
-            md2pdf, "PRINT_TIMEOUT", 0.5
-        ):
-            with self.assertRaisesRegex(md2pdf.Problem, "could not make the PDF"):
-                md2pdf.print_pdf(self.work / "document.html", self.work / "document.pdf", self.work)
-        # It was tried without the sandbox as well, and nothing of either try is left.
-        self.assertIn("--no-sandbox", self.arguments())
-        # They were killed, which takes a moment to show.
+    def gone(self):
+        """Whether nothing of the Chromium that was started last is running any more.
+        It was killed, which takes a moment to show."""
         group = int((self.work / "bin" / "pid").read_text())
         for _ in range(100):
             if not running(group):
                 break
             time.sleep(0.05)
-        self.assertEqual(running(group), [])
+        return running(group) == []
+
+    def test_a_chromium_that_never_finishes_is_ended_with_all_it_started(self):
+        with mock.patch.dict(os.environ, dict(self.environment, MODE="hangs")):
+            with self.assertRaisesRegex(md2pdf.Problem, "not ready after 0.5 seconds.*Do not run this again"):
+                with md2pdf.within(0.5):
+                    md2pdf.print_pdf(self.work / "document.html", self.work / "document.pdf", self.work)
+        # It is not for want of a sandbox that time ran out, and none is left to try
+        # without one.
+        self.assertNotIn("--no-sandbox", self.arguments())
+        self.assertTrue(self.gone())
+
+    def test_the_time_a_document_gets_is_not_taken_for_a_picture_that_cannot_be_read(self):
+        # Pictures are made smaller in a block that takes any error for a bad picture.
+        with self.assertRaisesRegex(md2pdf.Problem, "not ready after 0.2 seconds"):
+            with md2pdf.within(0.2):
+                try:
+                    time.sleep(5)
+                except Exception:
+                    self.fail("the end of the time was caught on the way out")
+
+    def test_a_helper_that_outlives_chromium_is_not_waited_for(self):
+        began = time.monotonic()
+        done = self.run_md2pdf("report.md", mode="lingers")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertTrue((self.out / "report.pdf").is_file())
+        # Far from the time a document gets, which is what the helper would have cost.
+        self.assertLess(time.monotonic() - began, 30)
+        self.assertTrue(self.gone())
 
     @unittest.skipUnless(
         any(shutil.which(name) for name in md2pdf.BROWSERS) and shutil.which("pdftotext"),

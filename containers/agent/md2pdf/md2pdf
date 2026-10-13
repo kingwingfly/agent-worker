@@ -26,6 +26,7 @@ The interpreter is the system's, started with -I: the agent's own Python package
 environment are not looked at.
 """
 
+import contextlib
 import errno
 import html
 import os
@@ -70,8 +71,14 @@ BROWSERS = (
     "google-chrome-stable",
     "google-chrome",
 )
-# Seconds Chromium is given for one document. It is slow to start on a fraction of a
-# processor, and a turn must not wait for one that never finishes.
+# Seconds a document is given, from its Markdown to its PDF. Chromium is slow to start on
+# a fraction of a processor, and a turn must not wait for one that never finishes.
+#
+# Claude Code has a time of its own for a command, and when that is up the agent reads
+# only that the command timed out, and runs it again. So the runner sets that time a
+# little longer than this one (`BASH_TIMEOUT_MS` in crates/runner/src/claude.rs), and it
+# is this script that says when time is up, and what to do then. Change one, and look at
+# the other.
 PRINT_TIMEOUT = 300
 
 # Chromium keeps every picture of a page in memory as it is when unpacked, four bytes to
@@ -94,6 +101,34 @@ Image.MAX_IMAGE_PIXELS = None
 
 class Problem(Exception):
     """Something the agent is told about, in words it can act on."""
+
+
+class TimeUp(BaseException):
+    """Raised wherever the script is when a document has had its time. It is not an
+    `Exception`, so that nothing on the way out takes it for a picture it cannot read."""
+
+
+@contextlib.contextmanager
+def within(seconds):
+    """Gives what runs in it `seconds`, and ends it with a `Problem` when they are over,
+    through the `finally` blocks that end Chromium and remove its files."""
+
+    def late(signum, frame):
+        raise TimeUp
+
+    before = signal.signal(signal.SIGALRM, late)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    except TimeUp:
+        raise Problem(
+            f"the PDF was not ready after {seconds:g} seconds, which is all a document "
+            "gets. Do not run this again as it is. Tell the user that the PDF could not "
+            "be made, and that a shorter document may work"
+        ) from None
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, before)
 
 
 # ---------------------------------------------------------------------------------------
@@ -630,33 +665,38 @@ def print_pdf(source, pdf, scratch):
     # Chromium's sandbox needs the kernel to let an ordinary user make namespaces, and a
     # container often does not. It is used where it works. Without it the container is
     # what holds a page in, and the page is one written here, with no script in it.
+    said = scratch / "chromium.log"
     for sandbox in ([], ["--no-sandbox"]):
         pdf.unlink(missing_ok=True)
-        # In a session of its own, so that all of its processes can be ended together.
-        with subprocess.Popen(
-            [browser, *sandbox, *options],
-            cwd=scratch,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            errors="replace",
-            start_new_session=True,
-        ) as chromium:
+        # What it says goes into a file. Of a pipe, every process it starts holds an end,
+        # and reading to the end of one means waiting for the last of them: a helper
+        # that outlives Chromium would be waited for with the PDF long written.
+        with open(said, "w") as log:
+            # In a session of its own, so that all of its processes can be ended together.
+            chromium = subprocess.Popen(
+                [browser, *sandbox, *options],
+                cwd=scratch,
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
             try:
-                said, _ = chromium.communicate(timeout=PRINT_TIMEOUT)
-            except subprocess.TimeoutExpired:
-                said = f"Chromium had not finished after {PRINT_TIMEOUT} seconds"
+                # However long it takes: `within` is what says when time is up.
+                chromium.wait()
             finally:
-                # Also when this script is interrupted: none of them may stay behind.
+                # Also when time is up or this script is interrupted: none of them may
+                # stay behind.
                 try:
                     os.killpg(chromium.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
+                chromium.wait()
         if chromium.returncode == 0 and pdf.is_file() and pdf.stat().st_size:
             return
     # Why it failed is for whoever runs the service. The agent can do nothing about it.
-    print("\n".join(said.splitlines()[-8:]), file=sys.stderr)
+    last = said.read_text(encoding="utf-8", errors="replace").splitlines()[-8:]
+    print("\n".join(last), file=sys.stderr)
     raise Problem(
         "Chromium could not make the PDF. The Markdown file is not at fault. "
         "Tell the user that the PDF could not be made"
@@ -721,9 +761,11 @@ def main(args):
     # Nothing but the PDF is written under /work, which is saved with the conversation.
     with tempfile.TemporaryDirectory(prefix="md2pdf-") as scratch:
         scratch = Path(scratch)
-        document = page(text, source.stem, source.resolve().parent, style, scratch)
-        (scratch / "document.html").write_text(document, encoding="utf-8")
-        print_pdf(scratch / "document.html", scratch / "document.pdf", scratch)
+        # Making the pictures smaller counts too: there can be any number of them.
+        with within(PRINT_TIMEOUT):
+            document = page(text, source.stem, source.resolve().parent, style, scratch)
+            (scratch / "document.html").write_text(document, encoding="utf-8")
+            print_pdf(scratch / "document.html", scratch / "document.pdf", scratch)
         OUT_DIR.mkdir(parents=True, exist_ok=True)
         put(scratch / "document.pdf", target)
 

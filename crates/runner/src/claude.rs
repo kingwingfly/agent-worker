@@ -26,6 +26,16 @@ pub const DOMAIN_SERVER: &str = "domain";
 /// How long Claude waits on one MCP tool call. A permission prompt stays open until the
 /// user answers, so this has to outlast any approval timeout the Durable Object applies.
 const MCP_TOOL_TIMEOUT_MS: &str = "3600000";
+/// How long Claude lets a shell command run when it names no time itself, in place of
+/// its own two minutes. With background commands switched off it ends one that takes
+/// longer, and says only that it timed out, which an agent answers by running the same
+/// command again.
+///
+/// `md2pdf` is the command that needs more: it gives a document `PRINT_TIMEOUT` seconds
+/// (containers/agent/md2pdf/md2pdf) and says itself when they are over, and what to do
+/// then. So this is that time and half a minute for it to start and to clear up, which a
+/// test below holds it to.
+const BASH_TIMEOUT_MS: &str = "330000";
 const STDERR_TAIL_LINES: usize = 20;
 
 /// What the reader task reports back. `generation` tells a restarted process apart from
@@ -142,6 +152,7 @@ impl Claude {
             .current_dir(&cfg.work_dir)
             .env("DISABLE_AUTOUPDATER", "1")
             .env("MCP_TOOL_TIMEOUT", MCP_TOOL_TIMEOUT_MS)
+            .env("BASH_DEFAULT_TIMEOUT_MS", BASH_TIMEOUT_MS)
             // A turn is "one user message in, one result out". Background commands and
             // scheduled tasks would have Claude start turns on its own, which the
             // session's bookkeeping, and a chat front end, have no place for.
@@ -358,6 +369,28 @@ mod tests {
 
     fn delta(delta: Value) -> Value {
         json!({ "type": "content_block_delta", "index": 0, "delta": delta })
+    }
+
+    #[test]
+    fn a_command_is_given_longer_than_md2pdf_gives_a_document() {
+        let script = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../containers/agent/md2pdf/md2pdf"
+        );
+        let script = std::fs::read_to_string(script).unwrap();
+        let document: u64 = script
+            .lines()
+            .find_map(|line| line.strip_prefix("PRINT_TIMEOUT = "))
+            .expect("md2pdf names the seconds it gives a document")
+            .parse()
+            .unwrap();
+        let command: u64 = BASH_TIMEOUT_MS.parse().unwrap();
+        // Half a minute more, for Python to start on a fraction of a processor and for
+        // what Chromium wrote to be removed again.
+        assert!(
+            command >= (document + 30) * 1000,
+            "md2pdf gives a document {document} s and a command is ended after {command} ms"
+        );
     }
 
     #[test]
