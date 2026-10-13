@@ -116,11 +116,20 @@ fn markdown_blocks(markdown: &str) -> Vec<Block> {
     let mut in_table = false;
     // The item marker was just written and nothing has followed it yet.
     let mut item_opened = false;
+    // Block quotes that are open: inside one, no item can stand without its tag.
+    let mut quotes = 0usize;
+    // The items of the list being rendered that are complete, see `Block::items`.
+    let mut items: Vec<String> = Vec::new();
 
     for event in Parser::new_ext(markdown, options) {
         match event {
             Event::Start(tag) => {
                 depth += 1;
+                // Where an item begins, the one before it is complete, with every tag
+                // that was opened in it closed again.
+                if matches!(tag, Tag::Item) && quotes == 0 && !html.trim().is_empty() {
+                    items.push(std::mem::take(&mut html).trim_end().to_owned());
+                }
                 // In a list whose items are separated by blank lines, each item's text is
                 // a paragraph. It belongs on the line its marker is on, not the next one.
                 let opens_item_text = item_opened && matches!(tag, Tag::Paragraph);
@@ -134,7 +143,10 @@ fn markdown_blocks(markdown: &str) -> Vec<Block> {
                 item_opened = matches!(tag, Tag::Item);
                 match tag {
                     Tag::Heading { .. } => html.push_str("<b>"),
-                    Tag::BlockQuote(_) => html.push_str("<blockquote>"),
+                    Tag::BlockQuote(_) => {
+                        quotes += 1;
+                        html.push_str("<blockquote>");
+                    }
                     Tag::CodeBlock(kind) => {
                         code_block = true;
                         match kind {
@@ -179,7 +191,10 @@ fn markdown_blocks(markdown: &str) -> Vec<Block> {
                 depth = depth.saturating_sub(1);
                 match tag {
                     TagEnd::Heading(_) => html.push_str("</b>"),
-                    TagEnd::BlockQuote(_) => html.push_str("</blockquote>"),
+                    TagEnd::BlockQuote(_) => {
+                        quotes = quotes.saturating_sub(1);
+                        html.push_str("</blockquote>");
+                    }
                     TagEnd::CodeBlock => {
                         code_block = false;
                         html.truncate(html.trim_end_matches('\n').len());
@@ -200,11 +215,12 @@ fn markdown_blocks(markdown: &str) -> Vec<Block> {
                     TagEnd::Link | TagEnd::Image if !in_table => html.push_str("</a>"),
                     _ => {}
                 }
-                if depth == 0 && !html.trim().is_empty() {
-                    blocks.push(Block {
-                        html: std::mem::take(&mut html).trim_end().to_owned(),
-                        preformatted: matches!(tag, TagEnd::CodeBlock | TagEnd::Table),
-                    });
+                if depth == 0 && !(html.trim().is_empty() && items.is_empty()) {
+                    blocks.push(Block::new(
+                        &mut html,
+                        &mut items,
+                        matches!(tag, TagEnd::CodeBlock | TagEnd::Table),
+                    ));
                 }
             }
             Event::Text(text) => {
@@ -218,16 +234,14 @@ fn markdown_blocks(markdown: &str) -> Vec<Block> {
             Event::Rule => blocks.push(Block {
                 html: "———".into(),
                 preformatted: false,
+                items: Vec::new(),
             }),
             Event::TaskListMarker(done) => html.push_str(if done { "☑ " } else { "☐ " }),
             _ => {}
         }
     }
-    if !html.trim().is_empty() {
-        blocks.push(Block {
-            html: html.trim_end().to_owned(),
-            preformatted: false,
-        });
+    if !(html.trim().is_empty() && items.is_empty()) {
+        blocks.push(Block::new(&mut html, &mut items, false));
     }
     blocks
 }
@@ -236,6 +250,35 @@ struct Block {
     html: String,
     /// Shown in a monospace box; keeps that when it has to be split.
     preformatted: bool,
+    /// For a list of more than one item: its items, each with those nested in it as
+    /// items of their own, one to a line of `html`. Every one is complete HTML, so a
+    /// list that is too long for one message can be cut between two of them and keep
+    /// its markup. A list in a block quote has none: its items stand inside the tag.
+    items: Vec<String>,
+}
+
+impl Block {
+    /// The block that ends here: the `items` that are complete and, in `html`, what
+    /// came after the last of them began. Both are left empty.
+    fn new(html: &mut String, items: &mut Vec<String>, preformatted: bool) -> Self {
+        let mut items = std::mem::take(items);
+        let last = std::mem::take(html).trim_end().to_owned();
+        if items.is_empty() {
+            return Self {
+                html: last,
+                preformatted,
+                items,
+            };
+        }
+        if !last.is_empty() {
+            items.push(last);
+        }
+        Self {
+            html: items.join("\n"),
+            preformatted,
+            items,
+        }
+    }
 }
 
 /// Splits text into pieces of at most `budget` UTF-16 units, at line breaks where it can.
@@ -278,6 +321,23 @@ fn split_text(text: &str, budget: usize) -> Vec<String> {
     pieces
 }
 
+/// HTML that is too long for one message as several, without its tags: among them a cut
+/// would leave one open. What was `preformatted` is shown so piece by piece.
+fn without_markup(html: &str, preformatted: bool) -> Vec<String> {
+    let text = strip_tags(html);
+    let pieces = split_text(&text, MESSAGE_BUDGET - 16).into_iter();
+    pieces
+        .map(|piece| {
+            let piece = piece.trim_end_matches('\n');
+            if preformatted {
+                format!("<pre>{piece}</pre>")
+            } else {
+                piece.to_owned()
+            }
+        })
+        .collect()
+}
+
 /// Claude's answer as one or more Telegram messages in HTML.
 pub fn answer(markdown: &str) -> Vec<String> {
     let mut messages = Vec::new();
@@ -288,18 +348,29 @@ pub fn answer(markdown: &str) -> Vec<String> {
         }
     };
     for block in markdown_blocks(markdown) {
-        if units(&block.html) > MESSAGE_BUDGET {
-            // Too big for one message. Markup cannot be cut safely, so it is dropped.
+        if units(&block.html) > MESSAGE_BUDGET && block.items.len() > 1 {
+            // A list too long for one message, which is the usual thing to be: it is
+            // cut between two of its items, and each keeps its markup, links included.
             flush(&mut current, &mut messages);
-            let text = strip_tags(&block.html);
-            for piece in split_text(&text, MESSAGE_BUDGET - 16) {
-                let piece = piece.trim_end_matches('\n');
-                messages.push(if block.preformatted {
-                    format!("<pre>{piece}</pre>")
+            for item in block.items {
+                if units(&item) > MESSAGE_BUDGET {
+                    flush(&mut current, &mut messages);
+                    messages.extend(without_markup(&item, false));
+                } else if units(&current) + units(&item) + 1 > MESSAGE_BUDGET {
+                    flush(&mut current, &mut messages);
+                    current = item;
                 } else {
-                    piece.to_owned()
-                });
+                    if !current.is_empty() {
+                        current.push('\n');
+                    }
+                    current.push_str(&item);
+                }
             }
+        } else if units(&block.html) > MESSAGE_BUDGET {
+            // Too big for one message, and nowhere to cut it with its markup whole. So
+            // that is dropped.
+            flush(&mut current, &mut messages);
+            messages.extend(without_markup(&block.html, block.preformatted));
         } else if units(&current) + units(&block.html) + 2 > MESSAGE_BUDGET {
             flush(&mut current, &mut messages);
             current = block.html;
@@ -1456,6 +1527,119 @@ mod tests {
         );
         let words: usize = messages.iter().map(|m| m.split_whitespace().count()).sum();
         assert_eq!(words, 1500, "nothing is lost");
+    }
+
+    /// Asserts that every tag opened in `html` is closed in it.
+    fn assert_whole(html: &str) {
+        for tag in ["a", "b", "i", "s", "code", "pre", "blockquote"] {
+            let opened = html.matches(&format!("<{tag}>")).count()
+                + html.matches(&format!("<{tag} ")).count();
+            let closed = html.matches(&format!("</{tag}>")).count();
+            assert_eq!(opened, closed, "<{tag}> in {html}");
+        }
+    }
+
+    #[test]
+    fn a_list_too_long_for_one_message_is_cut_between_items_and_keeps_its_links() {
+        let list: String = (1..=150)
+            .map(|n| {
+                format!("- [Source {n}](https://example.com/sources/{n}) says **something**\n")
+            })
+            .collect();
+        let messages = answer(&format!("Here is what I found:\n\n{list}\nThat is all."));
+        assert!(messages.len() > 2, "{}", messages.len());
+        for message in &messages {
+            assert!(units(message) <= MESSAGE_BUDGET);
+            assert_whole(message);
+        }
+        let all = messages.join("\n");
+        for n in 1..=150 {
+            let link = format!("<a href=\"https://example.com/sources/{n}\">Source {n}</a>");
+            assert_eq!(all.matches(&link).count(), 1, "source {n}");
+        }
+        assert_eq!(all.matches("<b>something</b>").count(), 150);
+        // The list begins a message, every message of it begins with an item, and what
+        // follows the list follows its last item.
+        assert_eq!(messages[0], "Here is what I found:");
+        for message in &messages[1..] {
+            assert!(message.starts_with("• <a href="), "{message}");
+        }
+        let last = messages.last().unwrap();
+        assert!(
+            last.ends_with("Source 150</a> says <b>something</b>\n\nThat is all."),
+            "{last}"
+        );
+    }
+
+    #[test]
+    fn a_long_list_is_cut_at_nested_items_too_and_goes_on_counting() {
+        let steps: String = (1..=120)
+            .map(|n| format!("   {n}. [step {n}](https://example.com/{n}) and what to do there\n"))
+            .collect();
+        let messages = answer(&format!("1. First do this:\n{steps}2. Then stop."));
+        assert!(messages.len() > 1);
+        assert!(
+            messages[0].starts_with("1. First do this:\n  1. <a href=\"https://example.com/1\">"),
+            "{}",
+            messages[0]
+        );
+        let number = |line: &str| -> u32 {
+            let line = line.strip_prefix("  ").expect("a nested item is indented");
+            line.split_once(". ").unwrap().0.parse().unwrap()
+        };
+        for pair in messages.windows(2) {
+            assert_whole(&pair[0]);
+            let before = number(pair[0].lines().last().unwrap());
+            let after = number(pair[1].lines().next().unwrap());
+            assert_eq!(after, before + 1);
+        }
+        assert!(
+            messages
+                .last()
+                .unwrap()
+                .ends_with("</a> and what to do there\n2. Then stop.")
+        );
+    }
+
+    #[test]
+    fn an_item_too_long_for_a_message_loses_its_markup_and_the_others_keep_theirs() {
+        let long = "word ".repeat(1000);
+        let markdown = format!(
+            "- [first](https://example.com/1)\n- **{}**\n- [last](https://example.com/2)",
+            long.trim_end()
+        );
+        let messages = answer(&markdown);
+        assert_eq!(
+            messages.first().unwrap(),
+            "• <a href=\"https://example.com/1\">first</a>"
+        );
+        assert_eq!(
+            messages.last().unwrap(),
+            "• <a href=\"https://example.com/2\">last</a>"
+        );
+        let middle = &messages[1..messages.len() - 1];
+        assert!(middle.len() > 1);
+        assert!(middle.iter().all(|message| !message.contains('<')));
+        assert!(
+            middle
+                .iter()
+                .all(|message| units(message) <= MESSAGE_BUDGET)
+        );
+        // A cut may fall inside a word, which the pieces put together have whole.
+        let words = middle.concat().matches("word").count();
+        assert_eq!(words, 1000, "nothing is lost");
+    }
+
+    #[test]
+    fn a_quoted_list_too_long_for_a_message_is_not_cut_inside_the_quote() {
+        let quoted: String = (1..=150)
+            .map(|n| format!("> - [source {n}](https://example.com/{n}) with words about it\n"))
+            .collect();
+        let messages = answer(&quoted);
+        assert!(messages.len() > 1);
+        // Its items stand inside the quote's tag, so it is cut as text, as before.
+        assert!(messages.iter().all(|message| !message.contains('<')));
+        assert!(messages.concat().contains("source 150 with words about it"));
     }
 
     #[test]
