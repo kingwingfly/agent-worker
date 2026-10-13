@@ -111,8 +111,18 @@ const GUEST_HELP: &str = "Mention me with what you want, or reply to one of my m
     /status — what I'm doing and today's usage";
 /// For a press that finds nothing to answer in a chat the bot is in, and where it is a
 /// guest. There the press may also be someone else's than the user's who was asked.
-const GONE: &str = "This is no longer open.";
+pub const GONE: &str = "This is no longer open.";
 const GUEST_GONE: &str = "Only whoever asked me can answer this, while it is open.";
+
+/// What a press that finds nothing to answer is told. A button without a message is on
+/// a guest's reply.
+fn gone(query: &CallbackQuery) -> &'static str {
+    if query.message.is_none() {
+        GUEST_GONE
+    } else {
+        GONE
+    }
+}
 
 /// Where what the bot says to one incoming message goes.
 enum Reply<'a> {
@@ -378,6 +388,10 @@ struct Live {
     unacked_events: u32,
     /// The chat is being moved to another conversation, or to another point in this one.
     switching: bool,
+    /// The turn whose end is being reported, by its id. That takes a while, and the turn
+    /// stays open for as long, so that no other begins. For the runner it is over: it
+    /// is not handed over again, and being told once more that it ended changes nothing.
+    reporting: Option<String>,
 }
 
 struct Inner {
@@ -499,6 +513,18 @@ impl Inner {
 
     fn turn(&self) -> Option<Turn> {
         self.session.borrow().turn.clone()
+    }
+
+    /// Whether the end of `turn` is being reported, see [`Live::reporting`].
+    fn reporting(&self, turn: &Turn) -> bool {
+        self.live.borrow().reporting.as_deref() == Some(turn.id.as_str())
+    }
+
+    /// The open turn, while it is the runner's to work on. One whose end is being
+    /// reported is not: handed over again, to a container started in place of one that
+    /// went away in the meantime, it would be run a second time.
+    fn turn_to_drive(&self) -> Option<Turn> {
+        self.turn().filter(|turn| !self.reporting(turn))
     }
 
     fn chat_id(&self) -> i64 {
@@ -929,12 +955,7 @@ impl Inner {
         let Some(html) = done else {
             // A guest's list can be pressed by anyone in the chat. Their press leads to
             // a session of their own, which has none of the listed things.
-            let gone = if query.message.is_none() {
-                GUEST_GONE
-            } else {
-                GONE
-            };
-            return bot.answer_callback(&query.id, Some(gone)).await;
+            return bot.answer_callback(&query.id, Some(gone(query))).await;
         };
         self.close_list(bot, query, &html).await
     }
@@ -1216,7 +1237,7 @@ impl Inner {
     }
 
     async fn drive_once(self: &Rc<Self>) -> Result<()> {
-        if self.turn().is_none() {
+        if self.turn_to_drive().is_none() {
             return Ok(());
         }
         let cfg = self.cfg()?;
@@ -1230,9 +1251,10 @@ impl Inner {
             self.establish(&cfg, &host).await?;
         }
 
-        // Read the turn again: `/stop` may have ended it during the awaits above. From
-        // here to the end nothing awaits, so the turn cannot change under this either.
-        let Some(turn) = self.turn() else {
+        // Read the turn again: `/stop` may have ended it during the awaits above, or the
+        // runner may have. From here to the end nothing awaits, so the turn cannot
+        // change under this either.
+        let Some(turn) = self.turn_to_drive() else {
             return Ok(());
         };
         // The runner ignores a turn it already has, so repeating this is harmless.
@@ -1478,12 +1500,29 @@ impl Inner {
         if seq <= self.session.borrow().last_seq {
             return;
         }
+        // A frame counts as seen once it has been handled, and the end of a turn takes
+        // a while to handle. A connection made anew in that time has the runner say
+        // again that the turn is over. The report under way answers for that frame, and
+        // acknowledges it when it is through: doing it twice would send the answer and
+        // the files twice.
+        if let FromRunner::TurnDone { turn_id, .. } = &frame
+            && self.live.borrow().reporting.as_deref() == Some(turn_id.as_str())
+        {
+            return;
+        }
 
         // Handling never leaves a frame worth seeing again: a prompt that cannot be
         // shown is answered for the user, and a finished turn is closed whatever part of
         // reporting it failed. So the frame counts as done either way.
         let streamed = matches!(frame, FromRunner::Event { .. });
+        let runner = self.session.borrow().control_secret.clone();
         self.handle(frame).await;
+        // A container started while that took its time counts its frames from one
+        // again. This frame's number says nothing about those: recorded, it would have
+        // every frame of the new runner up to that number taken for one seen before.
+        if self.session.borrow().control_secret != runner {
+            return;
+        }
         self.session.borrow_mut().last_seq = seq;
         let due = {
             let mut live = self.live.borrow_mut();
@@ -1923,19 +1962,14 @@ impl Inner {
         }
         let callback = data.and_then(Callback::parse);
         let approval = match &callback {
-            Some(callback) => self.store.approval(callback.request_id())?,
+            Some(callback) => self.open_prompt(callback.request_id())?,
             None => None,
         };
         // A guest's session is that of the user it answers, so nobody else's press gets
         // here. It gets to a session of their own, which has no such prompt.
         let guest = self.is_guest();
         let (Some(callback), Some(mut approval)) = (callback, approval) else {
-            let gone = if query.message.is_none() {
-                GUEST_GONE
-            } else {
-                GONE
-            };
-            return bot.answer_callback(&query.id, Some(gone)).await;
+            return bot.answer_callback(&query.id, Some(gone(&query))).await;
         };
         let chat_id = self.chat_id();
 
@@ -2011,11 +2045,27 @@ impl Inner {
             let retry = "I couldn't reach the agent just now. Please press again in a moment.";
             return bot.answer_callback(&query.id, Some(retry)).await;
         }
-        let _ = bot.answer_callback(&query.id, None).await;
-        self.store.delete_approval(&approval.request_id)?;
-        if always && let Some(key) = remember::key(&approval.tool_name, &approval.input) {
-            self.store.remember(&key)?;
+        // Reaching the runner can take a reconnection, and by the end of one the prompt
+        // may be closed: by another press, by its deadline, by the end of its turn, or
+        // because the runner turned out to be a new one that never asked.
+        if self.open_prompt(&approval.request_id)?.is_none() {
+            return bot.answer_callback(&query.id, Some(gone(&query))).await;
         }
+        // Recorded before anything else is awaited. A second press that arrived
+        // meanwhile would find the prompt still open, and the runner has taken this
+        // answer: the prompt would be marked with the other one, and "Always"
+        // remembered for a request that was declined.
+        let recorded = self
+            .store
+            .delete_approval(&approval.request_id)
+            .and_then(
+                |()| match remember::key(&approval.tool_name, &approval.input) {
+                    Some(key) if always => self.store.remember(&key),
+                    _ => Ok(()),
+                },
+            );
+        let _ = bot.answer_callback(&query.id, None).await;
+        recorded?;
         // A guest's prompt was shown in the reply, which the progress takes back below.
         let edited = if guest {
             Ok(())
@@ -2028,6 +2078,17 @@ impl Inner {
         // With the prompt answered, the progress is what to watch again.
         self.redraw_status().await;
         edited
+    }
+
+    /// The prompt a press answers, while there is something to answer: it is on record,
+    /// and the turn it was asked in is the runner's to work on. At the end of a turn the
+    /// runner answers what is still open itself, and the prompt stays on record only
+    /// until the report of that turn gets to it. A press in that time, taken for an
+    /// answer, would mark as allowed what was declined.
+    fn open_prompt(&self, request_id: &str) -> Result<Option<Approval>> {
+        let turn = self.turn_to_drive();
+        let approval = self.store.approval(request_id)?;
+        Ok(approval.filter(|approval| turn.is_some_and(|turn| turn.id == approval.turn_id)))
     }
 
     /// Gets a decision to the runner, reconnecting first if this object was evicted
@@ -2120,6 +2181,8 @@ impl Inner {
 
     async fn finish_turn(&self, result: TurnResult) {
         let Some(turn) = self.turn() else { return };
+        // From here to the end the turn is open and over at once, see `Live::reporting`.
+        self.live.borrow_mut().reporting = Some(turn.id.clone());
         let idle_ttl_ms = match self.cfg() {
             Ok(cfg) => {
                 self.report_turn(&cfg, &turn, &result).await;
@@ -2131,8 +2194,14 @@ impl Inner {
             }
         };
         // Only now may the next message start a turn: the files had to be read while
-        // nothing was changing them.
-        self.close_turn(idle_ttl_ms).await;
+        // nothing was changing them. A turn the alarm gave up on meanwhile is closed
+        // already, and the one that is open by now, if any, is another.
+        if self.turn().is_some_and(|open| open.id == turn.id) {
+            self.close_turn(idle_ttl_ms).await;
+        }
+        if self.reporting(&turn) {
+            self.live.borrow_mut().reporting = None;
+        }
     }
 
     /// Everything owed to the user when a turn ends. Each part is attempted whatever
@@ -2148,16 +2217,10 @@ impl Inner {
             Some(text) if !result.is_error => (render::DONE, render::answer(text)),
             _ if turn.stop_requested => (render::STOPPED, vec!["⏹ Stopped.".to_owned()]),
             None if !result.is_error => (render::DONE, vec!["(no answer)".to_owned()]),
-            detail => {
-                let mut message = format!(
-                    "⚠️ The agent stopped early ({}).",
-                    render::escape(&result.subtype)
-                );
-                if let Some(detail) = detail {
-                    message.push_str(&format!("\n<pre>{}</pre>", render::escape(detail)));
-                }
-                (render::FAILED, vec![message])
-            }
+            detail => (
+                render::FAILED,
+                vec![render::failure(&result.subtype, detail)],
+            ),
         };
         if self.is_guest() {
             return self.report_as_guest(&bot, turn, result, &messages).await;

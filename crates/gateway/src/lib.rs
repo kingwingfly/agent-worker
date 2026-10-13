@@ -33,7 +33,7 @@ use worker::{
 use crate::{
     bot::Bot,
     config::Config,
-    session::{NAME_HEADER, SESSION_BINDING, UPDATE_PATH},
+    session::{GONE, NAME_HEADER, SESSION_BINDING, UPDATE_PATH},
     update::Update,
 };
 
@@ -68,7 +68,7 @@ fn under(path: &str, prefix: &str) -> bool {
         .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
-async fn telegram(mut request: Request, env: &Env, cfg: &Config) -> Result<Response> {
+async fn telegram(request: Request, env: &Env, cfg: &Config) -> Result<Response> {
     let presented = request
         .headers()
         .get("x-telegram-bot-api-secret-token")?
@@ -77,22 +77,29 @@ async fn telegram(mut request: Request, env: &Env, cfg: &Config) -> Result<Respo
         return Response::error("forbidden", 403);
     }
     // From here on Telegram always gets a 200: anything else makes it send the update
-    // again.
+    // again. So nothing that goes wrong with the update is this request's error.
+    if let Err(error) = take_update(request, env, cfg).await {
+        console_error!("an update could not be handled: {error}");
+    }
+    Response::empty()
+}
+
+/// Hands an update to the session it is for, if it is for one and its user is let in.
+async fn take_update(mut request: Request, env: &Env, cfg: &Config) -> Result<()> {
     let body = request.text().await?;
     let Ok(update) = serde_json::from_str::<Update>(&body) else {
-        return Response::empty();
+        return Ok(());
     };
     let Some(origin) = update.origin() else {
         // A button nothing is known about still shows as pressed until it is answered.
         if let Some(query) = &update.callback_query {
-            let gone = Some("This is no longer open.");
-            let _ = Bot::new(cfg).answer_callback(&query.id, gone).await;
+            let _ = Bot::new(cfg).answer_callback(&query.id, Some(GONE)).await;
         }
-        return Response::empty();
+        return Ok(());
     };
     if !cfg.allowed_users.admits(origin.user_id) {
         turn_away(cfg, &update, origin.user_id).await;
-        return Response::empty();
+        return Ok(());
     }
 
     let name = origin.session;
@@ -108,7 +115,7 @@ async fn telegram(mut request: Request, env: &Env, cfg: &Config) -> Result<Respo
     if let Err(error) = stub.fetch_with_request(forwarded).await {
         console_error!("session {name} failed: {error}");
     }
-    Response::empty()
+    Ok(())
 }
 
 /// Tells a user the allow-list leaves out that the bot is not theirs to use, in the way

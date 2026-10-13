@@ -15,7 +15,11 @@ pub mod files;
 pub mod proxy;
 pub mod supervise;
 
-use std::{net::TcpListener, sync::Mutex};
+use std::{
+    net::TcpListener,
+    sync::{Mutex, mpsc},
+    thread,
+};
 
 use anyhow::Context;
 use async_trait::async_trait;
@@ -24,11 +28,60 @@ use pingora::{
     server::{RunArgs, Server, ShutdownSignal, ShutdownSignalWatch, ShutdownWatch},
     services::background::{BackgroundService, background_service},
 };
-use tokio::signal::unix::{SignalKind, signal};
+use tokio::{
+    signal::unix::{SignalKind, signal},
+    sync::watch,
+};
 
 pub use config::Config;
 
 use crate::{proxy::Front, supervise::Child};
+
+/// Whether this process has been told to stop.
+pub type Asked = watch::Receiver<bool>;
+
+/// Starts watching for the signals a container is stopped by, and returns where to
+/// look for them.
+///
+/// A signal nothing watches for ends the process there and then, with the MCP server
+/// left running. So this comes before the MCP server is started, and that takes a
+/// thread with a runtime of its own: the servers' runtimes belong to pingora, which only
+/// starts looking for signals once its port is open.
+fn watch_for_stop() -> anyhow::Result<Asked> {
+    let (asked_sender, asked) = watch::channel(false);
+    let (watching_sender, watching) = mpsc::channel();
+    thread::Builder::new()
+        .name("signals".into())
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => return drop(watching_sender.send(Err(error))),
+            };
+            runtime.block_on(async move {
+                let signals = signal(SignalKind::terminate())
+                    .and_then(|terminate| Ok((terminate, signal(SignalKind::interrupt())?)));
+                let (mut terminate, mut interrupt) = match signals {
+                    Ok(signals) => signals,
+                    Err(error) => return drop(watching_sender.send(Err(error))),
+                };
+                let _ = watching_sender.send(Ok(()));
+                tokio::select! {
+                    _ = terminate.recv() => {}
+                    _ = interrupt.recv() => {}
+                }
+                // Stays said after this thread is gone: a receiver keeps the last value.
+                let _ = asked_sender.send(true);
+            });
+        })?;
+    watching
+        .recv()
+        .context("the thread that watches for signals stopped")?
+        .context("watching for signals")?;
+    Ok(asked)
+}
 
 /// The file server, run by pingora next to the proxy.
 struct FileServer {
@@ -61,17 +114,16 @@ impl BackgroundService for FileServer {
 /// Either way there is nothing worth waiting for: in-flight requests are dropped.
 struct Stop {
     mcp_exit: supervise::Exit,
+    asked: Asked,
 }
 
 #[async_trait]
 impl ShutdownSignalWatch for Stop {
     async fn recv(&self) -> ShutdownSignal {
         let mut mcp_exit = self.mcp_exit.clone();
-        let mut terminate = signal(SignalKind::terminate()).expect("signals are available");
-        let mut interrupt = signal(SignalKind::interrupt()).expect("signals are available");
+        let mut asked = self.asked.clone();
         tokio::select! {
-            _ = terminate.recv() => {}
-            _ = interrupt.recv() => {}
+            _ = asked.wait_for(|asked| *asked) => {}
             _ = mcp_exit.wait_for(Option::is_some) => {}
         }
         ShutdownSignal::FastShutdown
@@ -87,6 +139,8 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
     let files_listener = TcpListener::bind(cfg.files_listen)
         .with_context(|| format!("the file server cannot listen on {}", cfg.files_listen))?;
     files_listener.set_nonblocking(true)?;
+    // From before there is an MCP server to leave behind.
+    let asked = watch_for_stop()?;
 
     // An MCP server can read from these where to listen and where to save files, instead
     // of being told twice.
@@ -98,9 +152,17 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
         ],
     )?;
     // Callers take an open port to mean the MCP server is there, so it is opened last.
-    if let Err(error) = child.wait_until_listening(cfg.mcp, cfg.start_timeout) {
-        child.stop();
-        return Err(error);
+    match child.wait_until_listening(cfg.mcp, cfg.start_timeout, &asked) {
+        Ok(true) => {}
+        // Told to stop before there was anything to serve.
+        Ok(false) => {
+            child.stop();
+            return Ok(());
+        }
+        Err(error) => {
+            child.stop();
+            return Err(error);
+        }
     }
 
     let mut server = Server::new(None).context("setting up the proxy")?;
@@ -126,6 +188,7 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
     server.run(RunArgs {
         shutdown_signal: Box::new(Stop {
             mcp_exit: child.exit(),
+            asked,
         }),
     });
 

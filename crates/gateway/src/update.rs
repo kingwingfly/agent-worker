@@ -81,11 +81,25 @@ pub struct StoppedGeneration {
     pub draft_id: i64,
 }
 
-/// For how many seconds Telegram asks to be left alone, if `refusal` is what it says to
-/// a call that came too soon after others: "Too Many Requests: retry after 35".
+/// How the refusal of a call that came too soon after others begins.
+pub const TOO_MANY: &str = "Too Many Requests";
+/// What stands between that and the seconds to wait.
+const RETRY_AFTER: &str = ": retry after ";
+
+/// What the error of such a call says when Telegram asked to be left alone for
+/// `seconds`: "Too Many Requests: retry after 35". Those are Telegram's words for it,
+/// but the bot writes them itself, from the figure that comes beside them, so that
+/// [`retry_after`] reads back what was written here and not a description that may be
+/// worded another way one day.
+pub fn too_many_requests(seconds: u64) -> String {
+    format!("{TOO_MANY}{RETRY_AFTER}{seconds}")
+}
+
+/// For how many seconds Telegram asks to be left alone, if `refusal` is the error of a
+/// call that came too soon after others, see [`too_many_requests`].
 pub fn retry_after(refusal: &str) -> Option<u64> {
-    let (_, seconds) = refusal.rsplit_once("Too Many Requests: retry after ")?;
-    seconds.trim().parse().ok()
+    let (_, rest) = refusal.rsplit_once(TOO_MANY)?;
+    rest.strip_prefix(RETRY_AFTER)?.trim().parse().ok()
 }
 
 /// Where an update belongs and who caused it.
@@ -245,6 +259,10 @@ mod tests {
         );
         assert_eq!(retry_after("Too Many Requests: retry after soon"), None);
         assert_eq!(retry_after(""), None);
+        // What the bot writes for such a refusal is what is read back here.
+        let written = format!("telegram sendMessage: {}", too_many_requests(120));
+        assert_eq!(retry_after(&written), Some(120));
+        assert!(written.contains(TOO_MANY));
     }
 
     #[test]
