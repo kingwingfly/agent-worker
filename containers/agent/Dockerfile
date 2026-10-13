@@ -77,12 +77,14 @@ USER agent
 # files here, none of them larger than the container has memory for.
 RUN python3 /etc/agent/md2pdf/test_md2pdf.py
 # Then one document through the command as the agent runs it. It has to come out as a
-# page, set in the font the style sheet names first. Chromium is started twice for it
-# where the builder allows no sandbox, as md2pdf does wherever that is so.
+# page, set in the font the style sheet names first. The name is looked for in the PDF
+# itself: Chromium writes these fonts as Type 3, and the pdffonts of this Debian shows
+# no name for one of those. Chromium is started twice for the document where the
+# builder allows no sandbox, as md2pdf does wherever that is so.
 RUN printf '<svg xmlns="http://www.w3.org/2000/svg" width="900" height="1600"/>' > /tmp/check.svg \
  && printf '# Check\n\n| a | b |\n|---|---|\n| 中文 | ok |\n\n![check](check.svg)\n' > /tmp/check.md \
  && md2pdf /tmp/check.md check.pdf | grep -F '(1 page)' \
- && pdffonts /work/out/check.pdf | grep -q NotoSansCJK \
+ && grep -a -q '/FontName /[A-Z+]*NotoSansCJK' /work/out/check.pdf \
  && rm /tmp/check.md /tmp/check.svg /work/out/check.pdf
 # The file helper has to be runnable, and to refuse what is not a file before it
 # contacts anything.
