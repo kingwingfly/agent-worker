@@ -11,23 +11,21 @@ FROM debian:bookworm-slim
 # The runner depends on how specific CLI flags behave. When changing the version, run
 # the checks under "Upgrading Claude Code" in the README.
 ARG CLAUDE_CODE_VERSION=2.1.296
-# md2pdf turns the agent's Markdown into PDFs with pandoc, which typesets through Typst.
-# The two are pinned together: pandoc writes Typst source for the Typst of its day.
-ARG PANDOC_VERSION=3.12.1
-ARG TYPST_VERSION=0.15.1
 
-# tini reaps the processes an agent's shell commands leave behind. poppler-utils gives
-# md2pdf the page count it reports. The fonts are for PDFs: Typst ships Latin fonts only.
+# tini reaps the processes an agent's shell commands leave behind.
+#
+# md2pdf turns the agent's Markdown into a web page with python3-markdown and has
+# Chromium print it. chromium-headless-shell is Chromium without its window: it prints
+# the same page as the whole browser in a third of the memory, and the container's
+# memory is shared with Claude Code. For the same reason md2pdf makes large pictures
+# smaller before Chromium sees them, with python3-pil. poppler-utils gives md2pdf the
+# page count it reports. Chromium brings no fonts, so the ones here are what a PDF is
+# set in.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      ca-certificates curl git ripgrep python3 xz-utils tini poppler-utils \
-      fonts-noto-cjk fonts-noto-color-emoji \
+      ca-certificates curl git ripgrep python3 python3-markdown python3-pil xz-utils \
+      tini poppler-utils chromium-headless-shell fonts-noto-cjk fonts-noto-color-emoji \
  && rm -rf /var/lib/apt/lists/*
-
-RUN curl -fsSL "https://github.com/typst/typst/releases/download/v${TYPST_VERSION}/typst-x86_64-unknown-linux-musl.tar.xz" \
-  | tar -xJ --strip-components=1 -C /usr/local/bin typst-x86_64-unknown-linux-musl/typst \
- && curl -fsSL "https://github.com/jgm/pandoc/releases/download/${PANDOC_VERSION}/pandoc-${PANDOC_VERSION}-linux-amd64.tar.gz" \
-  | tar -xz --strip-components=2 -C /usr/local/bin "pandoc-${PANDOC_VERSION}/bin/pandoc"
 
 # Everything the agent user writes at run time is under /work or its home directory.
 # Nothing may be prepared under /run: Cloudflare mounts a fresh one over it when the
@@ -50,8 +48,8 @@ COPY containers/agent/system.md /etc/agent/system.md
 COPY containers/agent/settings.json /etc/agent/settings.json
 COPY containers/agent/md2pdf/md2pdf /usr/local/bin/md2pdf
 COPY containers/agent/mcp-file /usr/local/bin/mcp-file
-COPY containers/agent/md2pdf/defaults.yaml containers/agent/md2pdf/header.typ \
-     containers/agent/md2pdf/tidy.lua /etc/agent/md2pdf/
+COPY containers/agent/md2pdf/style.css containers/agent/md2pdf/test_md2pdf.py \
+     /etc/agent/md2pdf/
 COPY --chown=agent:agent skills/ /home/agent/.claude/skills/
 # Standing instructions for the agent. They go into Claude Code's own directory and not
 # into /work: the runner starts it with `--setting-sources user`, under which a CLAUDE.md
@@ -72,15 +70,20 @@ RUN chown -R agent:agent /home/agent/.claude \
  && chmod 755 /usr/local/bin/md2pdf /usr/local/bin/mcp-file
 
 USER agent
-# Fail the build, not a user's request, if the PDF toolchain does not fit together. The
-# picture is there because header.typ measures every picture to decide its size.
+# Fail the build, not a user's request, if the PDF toolchain does not fit together.
+# md2pdf's own tests come first, run with the libraries and the Chromium of this image:
+# md2pdf runs without the user being asked, and they are what says that nothing in a
+# Markdown file reaches Chromium but text, a short list of tags and pictures that are
+# files here, none of them larger than the container has memory for.
+RUN python3 /etc/agent/md2pdf/test_md2pdf.py
+# Then one document through the command as the agent runs it. It has to come out as a
+# page, set in the font the style sheet names first. Chromium is started twice for it
+# where the builder allows no sandbox, as md2pdf does wherever that is so.
 RUN printf '<svg xmlns="http://www.w3.org/2000/svg" width="900" height="1600"/>' > /tmp/check.svg \
  && printf '# Check\n\n| a | b |\n|---|---|\n| 中文 | ok |\n\n![check](check.svg)\n' > /tmp/check.md \
- && md2pdf /tmp/check.md check.pdf \
+ && md2pdf /tmp/check.md check.pdf | grep -F '(1 page)' \
+ && pdffonts /work/out/check.pdf | grep -q NotoSansCJK \
  && rm /tmp/check.md /tmp/check.svg /work/out/check.pdf
-# md2pdf runs without the user being asked, so it has to refuse a file whose name pandoc
-# would take for an option, before it starts pandoc.
-RUN touch /tmp/-check.md; md2pdf /tmp/-check.md 2>/dev/null; [ "$?" -eq 1 ] && rm /tmp/-check.md
 # The file helper has to be runnable, and to refuse what is not a file before it
 # contacts anything.
 RUN mcp-file get .. 2>/dev/null; [ "$?" -eq 1 ]
