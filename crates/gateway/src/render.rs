@@ -95,17 +95,8 @@ fn truncate(text: &str, limit: usize) -> String {
 /// Removes tags and decodes entities from HTML produced by this module, for the rare case
 /// where Telegram refuses the markup and the message is re-sent as plain text.
 pub fn to_plain(html: &str) -> String {
-    let mut out = String::with_capacity(html.len());
-    let mut in_tag = false;
-    for c in html.chars() {
-        match c {
-            '<' => in_tag = true,
-            '>' if in_tag => in_tag = false,
-            _ if !in_tag => out.push(c),
-            _ => {}
-        }
-    }
-    out.replace("&lt;", "<")
+    strip_tags(html)
+        .replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
         .replace("&amp;", "&")
