@@ -34,7 +34,7 @@ use crate::{
     bot::Bot,
     config::Config,
     session::{GONE, NAME_HEADER, SESSION_BINDING, UPDATE_PATH},
-    update::Update,
+    update::{TurnedAway, Update},
 };
 
 #[event(fetch)]
@@ -119,29 +119,22 @@ async fn take_update(mut request: Request, env: &Env, cfg: &Config) -> Result<()
 }
 
 /// Tells a user the allow-list leaves out that the bot is not theirs to use, in the way
-/// the update they caused can be answered: with a message, with the one reply a guest
-/// summon gets, or over the button they pressed. The id is what the operator needs to
-/// let them in.
+/// [`Update::turned_away`] has for the update they caused, if it has one. The id is what
+/// the operator needs to let them in.
 async fn turn_away(cfg: &Config, update: &Update, user_id: i64) {
+    let Some(way) = update.turned_away() else {
+        return;
+    };
     let bot = Bot::new(cfg);
     let private = "This bot is private. Your Telegram user id is";
     let notice = format!("{private} <code>{user_id}</code>.");
-    let told = if let Some(message) = &update.message {
-        bot.send_message(message.chat.id, &notice, None)
-            .await
-            .map(drop)
-    } else if let Some(query_id) = update
-        .guest_message
-        .as_ref()
-        .and_then(|message| message.guest_query_id.as_deref())
-    {
-        bot.answer_guest(query_id, &notice, None).await.map(drop)
-    } else if let Some(query) = &update.callback_query {
-        let notice = format!("{private} {user_id}.");
-        bot.answer_callback(&query.id, Some(&notice)).await
-    } else {
-        // Nobody is waiting for an answer to a press on a draft's Stop button.
-        Ok(())
+    let told = match way {
+        TurnedAway::InChat(chat_id) => bot.send_message(chat_id, &notice, None).await.map(drop),
+        TurnedAway::InReply(query_id) => bot.answer_guest(query_id, &notice, None).await.map(drop),
+        TurnedAway::OverButton(query_id) => {
+            let notice = format!("{private} {user_id}.");
+            bot.answer_callback(query_id, Some(&notice)).await
+        }
     };
     if let Err(error) = told {
         console_error!("a user who is not let in could not be told: {error}");
