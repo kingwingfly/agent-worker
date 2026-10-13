@@ -1,62 +1,742 @@
-#!/bin/sh
-# md2pdf: render a Markdown file as a PDF.
+#!/usr/bin/python3 -I
+"""md2pdf: render a Markdown file as a PDF.
+
+  md2pdf report.md             writes /work/out/report.pdf
+  md2pdf report.md summary.pdf writes /work/out/summary.pdf
+
+The PDF always goes into the output directory: of an output name given with a
+directory, only the name is used. Pictures are looked up relative to the Markdown file,
+and one with more pixels than paper can show is printed from a smaller copy, which is
+what keeps Chromium within the memory of a small container.
+The Markdown is turned into a web page and Chromium prints that page; the look of it is
+the style sheet beside this script's settings, so the agent only ever has to write
+Markdown. On success it prints the path and the page count, which leaves the agent
+nothing to go and check, and that the user is about to receive the PDF: an agent not
+told so moves the Markdown file and its pictures into the output directory to have them
+delivered, and everything in there is sent.
+
+The agent runs this without asking the user, so its arguments must not be able to make
+it do anything but that: read one Markdown file and write one PDF where PDFs go. A
+browser could do a good deal more, and what the Markdown says is not to be trusted
+either, since the agent writes it from what it has read. So the page Chromium is given
+is built here from a short list of tags (`Page`), runs no script, and can load nothing
+but pictures that are files on this machine. Nothing in it reaches the network.
+
+The interpreter is the system's, started with -I: the agent's own Python packages and
+environment are not looked at.
+"""
+
+import errno
+import html
+import os
+import re
+import resource
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+from html.parser import HTMLParser
+from pathlib import Path
+from typing import NamedTuple
+from urllib.parse import unquote, urlsplit
+from xml.etree import ElementTree
+
+import markdown
+from markdown.blockprocessors import BlockProcessor
+from markdown.extensions import Extension
+from markdown.extensions.fenced_code import FencedCodeExtension
+from markdown.extensions.footnotes import FootnoteExtension
+from markdown.extensions.nl2br import Nl2BrExtension
+from markdown.extensions.sane_lists import SaneListExtension
+from markdown.extensions.tables import TableExtension
+from markdown.inlinepatterns import InlineProcessor, SimpleTagInlineProcessor
+from markdown.preprocessors import Preprocessor
+from markdown.util import AtomicString
+from PIL import Image, ImageOps
+
+HOME = Path(os.environ.get("MD2PDF_HOME", "/etc/agent/md2pdf"))
+OUT_DIR = Path(os.environ.get("MD2PDF_OUT_DIR", "/work/out"))
+
+# Names Chromium goes by. The image has the first: the headless shell is Chromium without
+# its window and all that serves one, and prints the same page in a third of the memory,
+# which it shares with Claude Code in a small container. The whole browsers are for
+# trying this out on a machine that has one of them.
+BROWSERS = (
+    "chromium-headless-shell",
+    "chrome-headless-shell",
+    "chromium",
+    "chromium-browser",
+    "google-chrome-stable",
+    "google-chrome",
+)
+# Seconds Chromium is given for one document. It is slow to start on a fraction of a
+# processor, and a turn must not wait for one that never finishes.
+PRINT_TIMEOUT = 300
+
+# Chromium keeps every picture of a page in memory as it is when unpacked, four bytes to
+# the pixel, until the PDF is written: thirty pictures from a chat took 900 MB of a
+# container that has 1 GiB, with Claude Code running in it. So it is given a picture of
+# at most `EACH` pixels, and where there are many, each gets its share of `IN_ALL`. The
+# style sheet shows a picture in half the width of the text at most, where two million
+# pixels are over 400 to the inch: enough to read a screenshot that is looked at closely.
+EACH = 2_000_000
+IN_ALL = 32_000_000
+# The kinds of picture that are made smaller. Anything else is given to Chromium as it
+# is: a drawing (SVG) has no pixels to begin with.
+KINDS = ("JPEG", "PNG", "WEBP", "GIF", "BMP")
+# The pixels that are unpacked here to make the smaller copy, at the same four bytes
+# each. A JPEG is read at an eighth of its size if need be; other kinds are read whole.
+LARGEST = 40_000_000
+# The size of a picture is checked here, by those numbers.
+Image.MAX_IMAGE_PIXELS = None
+
+
+class Problem(Exception):
+    """Something the agent is told about, in words it can act on."""
+
+
+# ---------------------------------------------------------------------------------------
+# Markdown as language models write it
 #
-#   md2pdf report.md             writes /work/out/report.pdf
-#   md2pdf report.md summary.pdf writes /work/out/summary.pdf
-#
-# The PDF always goes into the output directory: of an output name given with a
-# directory, only the name is used. Images are looked up relative to the Markdown file.
-# Page setup and fonts live next to this script's defaults file, so the agent only ever
-# has to write Markdown. On success it prints the path and the page count, which leaves
-# the agent nothing to go and check, and that the user is about to receive the PDF: an
-# agent not told so moves the Markdown file and its pictures into the output directory
-# to have them delivered, and everything in there is sent.
-#
-# The agent runs this without asking the user, so its arguments must not be able to make
-# it do anything but that: read one Markdown file and write one PDF where PDFs go.
-set -eu
+# The Markdown library reads by older rules than the ones models have picked up from
+# GitHub, and in print the difference shows: a list is not a list without an empty line
+# above it, a nested one has to be indented by four spaces, a code block cannot stand
+# inside a list item. `Mends` makes it read what was meant.
+# ---------------------------------------------------------------------------------------
 
-home="${MD2PDF_HOME:-/etc/agent/md2pdf}"
-out_dir="${MD2PDF_OUT_DIR:-/work/out}"
+FENCE = re.compile(r"^( *)(`{3,}|~{3,})(.*)$")
+ITEM = re.compile(r"^( *)([-*+]|\d{1,9}\.)( +)(\S.*)$")
+# `* * *` and `---` are rules, though the first looks like a list item.
+RULE = re.compile(r"^ *([-*_])(?: *\1){2,} *$")
+# A table row, written with a pipe at both ends.
+ROW = re.compile(r"^ *\|.*\| *$")
+# A heading or a quotation: like a row, it is not the text of the line above carried on.
+STARTER = re.compile(r"^ *(?:#{1,6}(?: |$)|>)")
+# What the Markdown library accepts as the language of a fenced block.
+LANGUAGE = re.compile(r"[\w#.+-]*")
+# A line that is nothing but the HTML tags Markdown gets wrapped in, to centre it or to
+# fold it away.
+WRAPPER = re.compile(r"(?i)^ *(?:</?(?:article|center|details|div|p|section)(?:\s[^<>]*)?> *)+$")
 
-fail() {
-  echo "md2pdf: $*" >&2
-  exit 1
-}
 
-if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
-  echo "usage: md2pdf INPUT.md [OUTPUT.pdf]" >&2
-  exit 2
-fi
-input=$1
-[ -f "$input" ] || fail "no such file: $input"
+class Level(NamedTuple):
+    """A list that is open at some depth, as its latest item describes it."""
 
-case $input in
-  */*) dir=${input%/*} name=${input##*/} ;;
-  *) dir=. name=$input ;;
-esac
-[ -n "$dir" ] || dir=/
-# pandoc takes options wherever they stand on its command line, and some of them make it
-# run a program. A file name is never handed to it in a form it could read as one.
-case $name in
-  -*) fail "the name of the Markdown file must not begin with a dash: $name" ;;
-esac
+    # Column the item's text starts in. A line indented this far belongs to the item.
+    text: int
+    ordered: bool
 
-output=${2:-${name%.*}.pdf}
-output=${output##*/}
-case $output in
-  "" | . | .. | -*) fail "not a name for the PDF: ${2:-}" ;;
-esac
-output="$out_dir/$output"
-mkdir -p "$out_dir"
 
-cd -- "$dir"
-pandoc --defaults="$home/defaults.yaml" --output="$output" "./$name"
+class Lines(Preprocessor):
+    """Rewrites the lines of the Markdown into what the library takes for the same thing.
 
-pages=$(pdfinfo "$output" 2>/dev/null | awk '/^Pages:/ { print $2 }')
-case $pages in
-  "") count="" ;;
-  1) count=" (1 page)" ;;
-  *) count=" ($pages pages)" ;;
-esac
-echo "wrote $output$count; the user receives it when you finish, so there is nothing to move or copy"
+    - An empty line goes in above a list or a table that follows text directly.
+    - List items are indented by four spaces for each list they are inside, whatever
+      they were indented by, and so is the rest of what belongs to an item.
+    - A fenced code block is moved out to the margin, where alone it is recognised, and
+      its first line is cut down to the language. That ends a list it stood in; the
+      list goes on below it, numbered from where it stopped.
+    - A line of HTML that only wraps what follows becomes an empty line. Left in, it
+      would make the library take all it encloses for HTML and not for Markdown.
+    """
+
+    def run(self, lines):
+        out = []
+        levels = []
+        # The fence that opened the code block being read, and how far it was indented.
+        fence = None
+        # The line before was empty, or there is none.
+        blank = True
+        # The lines since the last empty one have a list item among them.
+        listed = False
+        # The line before was a table row.
+        row = False
+        # What a line is indented by to carry on the text of the one before, in a list.
+        hang = 0
+
+        def gap():
+            nonlocal blank, listed, row
+            if not blank:
+                out.append("")
+            blank, listed, row = True, False, False
+
+        def depth_of(indent):
+            """How many of the open lists a line indented this far is inside."""
+            for depth in range(len(levels), 0, -1):
+                if indent >= levels[depth - 1].text:
+                    return depth
+            return 0
+
+        for line in lines:
+            indent = len(line) - len(line.lstrip(" "))
+
+            if fence:
+                closing = FENCE.match(line)
+                if closing and closing[2].startswith(fence[0]) and not closing[3].strip():
+                    out.append(fence[0])
+                    fence = None
+                else:
+                    out.append(line[min(indent, fence[1]):])
+                continue
+            opening = FENCE.match(line)
+            # Backticks after the fence make it a piece of code within a line.
+            if opening and "`" not in opening[3]:
+                info = opening[3].strip()
+                if not info.startswith("{"):
+                    info = LANGUAGE.match(info)[0]
+                fence = (opening[2], indent)
+                levels.clear()
+                out.append(opening[2] + info)
+                blank, listed, row = False, False, False
+                continue
+
+            if not line.strip() or WRAPPER.match(line):
+                out.append("")
+                blank, listed, row = True, False, False
+                continue
+
+            item = None if RULE.match(line) else ITEM.match(line)
+            if item and not levels:
+                if blank:
+                    # Indented this far under an empty line, it is code.
+                    if indent >= 4:
+                        item = None
+                # As elsewhere, only a list that begins at 1 may break into a paragraph:
+                # a line of text can happen to begin with "2019. ".
+                elif item[2][0].isdigit() and int(item[2][:-1]) != 1:
+                    item = None
+            if item:
+                marker, spaces = item[2], len(item[3])
+                ordered = marker[0].isdigit()
+                depth = depth_of(indent)
+                # Bullets and numbers at one depth are two lists, and the library only
+                # starts the second after an empty line.
+                other_kind = depth < len(levels) and levels[depth].ordered != ordered
+                if not blank and (not listed or other_kind):
+                    gap()
+                levels[depth:] = [
+                    Level(indent + len(marker) + (spaces if spaces <= 4 else 1), ordered)
+                ]
+                hang = 4 * depth
+                out.append(" " * hang + marker + " " + item[4])
+                blank, listed, row = False, True, False
+                continue
+
+            is_row = bool(ROW.match(line))
+            starts = (is_row and not row) or STARTER.match(line) or RULE.match(line)
+            if levels:
+                if starts:
+                    gap()
+                if blank:
+                    # Under an empty line, how far a line is indented says which item
+                    # it belongs to, if any.
+                    depth = depth_of(indent)
+                    del levels[depth:]
+                    if depth:
+                        hang = 4 * depth
+                        line = " " * hang + line[levels[depth - 1].text:]
+                else:
+                    line = " " * hang + line.lstrip(" ")
+            elif is_row and not row:
+                gap()
+            out.append(line)
+            blank, row = False, is_row
+
+        # A block that is never closed is code to the end, not text full of backticks.
+        if fence:
+            while not out[-1]:
+                out.pop()
+            out += [fence[0], ""]
+        return out
+
+
+# The pieces of a table row: code, in which a pipe is a pipe; an escaped character; a
+# pipe that ends a cell; anything else.
+PIECE = re.compile(r"(`+)(?!`).+?(?<!`)\1(?!`)|\\.|(\|)|.", re.DOTALL)
+# A cell of the line that divides a table's header from its rows.
+DIVIDER = re.compile(r" *:?-+:? *")
+
+
+def cells(row):
+    """Cuts a row into the text of its cells."""
+    result, cell = [], ""
+    for piece in PIECE.finditer(row.strip()[1:-1]):
+        if piece[2]:
+            result.append(cell.strip())
+            cell = ""
+        else:
+            cell += piece[0]
+    result.append(cell.strip())
+    return result
+
+
+class Rows(BlockProcessor):
+    """Makes a table of rows that are none to Markdown.
+
+    Markdown only recognises a table that starts with a header row and a `|---|` line
+    of as many columns. Rows written on their own, typically totals set apart from the
+    table above them, would be printed as text full of pipes. A paragraph in which
+    every line is `| ... |` becomes a table instead, with no header unless its second
+    line is that of a table.
+    """
+
+    def test(self, parent, block):
+        return all(ROW.match(line) for line in block.split("\n"))
+
+    def run(self, parent, blocks):
+        rows = [cells(line) for line in blocks[0].split("\n")]
+        divider = [all(DIVIDER.fullmatch(cell) for cell in row) for row in rows]
+        head = rows[:1] if len(rows) > 1 and divider[1] and not divider[0] else []
+        body = [row for row, divides in zip(rows[len(head):], divider[len(head):]) if not divides]
+        # Columns that are empty in every row are padding, put there to line the rows
+        # up with a table above. They would only show as thin empty boxes.
+        kept = [
+            column
+            for column in range(max(map(len, rows)))
+            if any(row[column:column + 1] not in ([], [""]) for row in head + body)
+        ]
+        if not kept:
+            return False
+        blocks.pop(0)
+        table = ElementTree.SubElement(parent, "table")
+        for section, tag, lines in (("thead", "th", head), ("tbody", "td", body)):
+            if not lines:
+                continue
+            section = ElementTree.SubElement(table, section)
+            for row in lines:
+                line = ElementTree.SubElement(section, "tr")
+                for column in kept:
+                    ElementTree.SubElement(line, tag).text = "".join(row[column:column + 1])
+        return True
+
+
+# An address written out in the text. It ends where the characters of an address do, so
+# that Chinese running on behind it is not taken along.
+ADDRESS = r"(?<![A-Za-z0-9/])(https?://[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+)"
+
+
+class Address(InlineProcessor):
+    """Makes a link of an address that stands in the text as it is."""
+
+    def handleMatch(self, m, data):
+        address = m.group(1).rstrip(".,;:!?'*")
+        # A bracket at the end closes one in the text, unless the address opened it.
+        while address[-1:] in (")", "]") and address.count(address[-1]) > address.count(
+            "(" if address[-1] == ")" else "["
+        ):
+            address = address[:-1].rstrip(".,;:!?'*")
+        link = ElementTree.Element("a", href=address)
+        link.text = AtomicString(address)
+        return link, m.start(0), m.start(0) + len(address)
+
+
+class Mends(Extension):
+    """What `to_html` adds to the Markdown library."""
+
+    def extendMarkdown(self, md):
+        # After tabs have become spaces, before fenced blocks are looked for.
+        md.preprocessors.register(Lines(md), "md2pdf_lines", 27)
+        # After real tables have been tried.
+        md.parser.blockprocessors.register(Rows(md.parser), "md2pdf_rows", 74)
+        # After HTML written into the text has been set aside whole, addresses and all.
+        md.inlinePatterns.register(Address(ADDRESS, md), "md2pdf_address", 85)
+        md.inlinePatterns.register(
+            SimpleTagInlineProcessor(r"(~~)(?=\S)(.+?)(?<=\S)~~", "del"), "md2pdf_del", 65
+        )
+
+
+def to_html(text):
+    """Markdown to HTML, as the library writes it. `Page` decides what is kept of it."""
+    return markdown.Markdown(
+        extensions=[
+            TableExtension(),
+            FencedCodeExtension(),
+            # A line break in the Markdown is a line break in the PDF, as in a chat
+            # window. Strict Markdown would join the lines, which turns an address block
+            # into one run-on line.
+            Nl2BrExtension(),
+            # A list numbered from 3 is numbered from 3.
+            SaneListExtension(),
+            # Without it, the text of a footnote is taken for the address of a link
+            # that is never used, and is lost.
+            FootnoteExtension(BACKLINK_TEXT=""),
+            Mends(),
+        ],
+        output_format="html",
+    ).convert(text)
+
+
+# ---------------------------------------------------------------------------------------
+# The page Chromium prints
+# ---------------------------------------------------------------------------------------
+
+# The tags a page is made of: what Markdown turns into, and the plain formatting a model
+# sometimes writes as HTML. They are written out anew, without what they came with.
+KEPT = frozenset(
+    """a b blockquote br code del em h1 h2 h3 h4 h5 h6 hr i img ins kbd li mark ol p pre s
+    small strong sub sup table tbody td tfoot th thead tr u ul""".split()
+)
+# Real HTML that has no place in print. What these enclose stays, in lines of its own.
+BLOCKS = frozenset(
+    """address article aside body center dd details div dl dt fieldset figcaption figure
+    footer form head header html main nav section summary""".split()
+)
+# What these enclose stays where it is in the line.
+DROPPED = frozenset("abbr acronym big cite font label span strike tt".split())
+EMPTY = frozenset(("br", "hr", "img"))
+LINKED = re.compile(r"(?i)(https?://|mailto:)\S")
+ALIGNED = re.compile(r"text-align:\s*(left|right|center)")
+
+
+class Page(HTMLParser):
+    """Writes the HTML of a document again, out of nothing but what is known to be safe.
+
+    Markdown lets HTML through as it is written, scripts and frames included, and the
+    agent writes Markdown out of text by third parties. So nothing is passed on here:
+    every tag in the result is written by this class, with attributes it has made
+    itself, and all text is escaped. What a tag was like in the source decides only
+    which of three things happens to it:
+
+      a tag of `KEPT`       is written anew, so `<br>` is a line break in a table cell
+      a tag of `BLOCKS`     becomes a plain `<div>`
+      a tag of `DROPPED`    is left out, and what it encloses is kept
+      anything else         is printed as written: "Dear <customer name>" must not
+                            become "Dear ", and a script is so much text
+    """
+
+    def __init__(self, picture):
+        super().__init__(convert_charrefs=True)
+        self.picture = picture
+        self.out = []
+        # For each link that is open, whether its tag was written.
+        self.links = []
+
+    def set_cdata_mode(self, *args, **kwargs):
+        """Reads on as usual after `<script>` and `<style>`.
+
+        The parser would take all that follows for the script, to the end of the
+        document if it is never closed, and those tags are printed as text here.
+        """
+
+    def handle_starttag(self, tag, attrs):
+        attrs = {name: value or "" for name, value in attrs}
+        if tag == "a":
+            # A link in a link is none, and a link that leads to no page is text.
+            keep = not any(self.links) and bool(LINKED.match(attrs.get("href", "")))
+            self.links.append(keep)
+            if keep:
+                self.write("a", href=attrs["href"].strip())
+        elif tag == "img":
+            self.write("img", src=self.picture(attrs.get("src", "")), alt=attrs.get("alt", ""))
+        elif tag in ("td", "th"):
+            aligned = ALIGNED.search(attrs.get("style", "")) or ALIGNED.search(
+                "text-align:" + attrs.get("align", "").lower()
+            )
+            self.write(
+                tag,
+                style=aligned and "text-align:" + aligned[1],
+                **{name: attrs.get(name, "") for name in ("colspan", "rowspan")},
+            )
+        elif tag == "ol":
+            self.write(tag, start=attrs.get("start", ""))
+        elif tag in KEPT:
+            self.write(tag)
+        elif tag in BLOCKS:
+            self.write("div")
+        elif tag not in DROPPED:
+            self.out.append(html.escape(self.get_starttag_text(), quote=False))
+
+    def handle_endtag(self, tag):
+        if tag == "a":
+            if self.links and self.links.pop():
+                self.out.append("</a>")
+        elif tag in KEPT:
+            if tag not in EMPTY:
+                self.out.append(f"</{tag}>")
+        elif tag in BLOCKS:
+            self.out.append("</div>")
+        elif tag not in DROPPED:
+            self.out.append(html.escape(f"</{tag}>", quote=False))
+
+    def handle_data(self, data):
+        self.out.append(html.escape(data, quote=False))
+
+    def write(self, tag, **attrs):
+        """Writes an opening tag. A number is the only thing an attribute not named in
+        `handle_starttag` may say."""
+        text = tag
+        for name, value in attrs.items():
+            if value and (name in ("href", "src", "alt", "style") or value.isdigit()):
+                text += f' {name}="{html.escape(value)}"'
+        self.out.append(f"<{text}>")
+
+
+def fitted(path, allowed, copy):
+    """The picture Chromium is to load for the one at `path`: the file itself if it has
+    no more than `allowed` pixels, and else a smaller one written as `copy`, with the
+    ending of its kind. The file at `path` is only read."""
+    # The library has a dozen ways of saying that a file is damaged, or no picture of
+    # these kinds. Whichever it is, Chromium is given the file and shows what it can.
+    try:
+        image = Image.open(path, formats=KINDS)
+    except Exception:
+        return path
+    with image:
+        width, height = image.size
+        # Sixteen bits to the colour and the like are rare, and are left as they are.
+        known = image.mode in ("1", "L", "LA", "P", "PA", "RGB", "RGBA", "CMYK")
+        if width * height <= allowed or not known:
+            return path
+        shrink = (allowed / (width * height)) ** 0.5
+        size = max(1, int(width * shrink)), max(1, int(height * shrink))
+        photograph = image.format in ("JPEG", "MPO")
+        if photograph:
+            # Unpacks it at a half, a quarter or an eighth, whichever is still enough.
+            image.draft(None, size)
+        if image.width * image.height > LARGEST:
+            raise Problem(
+                f"the picture {path.name} is too large to put into a PDF, at {width} by "
+                f"{height} pixels. Use a smaller one, or take it out"
+            )
+        try:
+            profile = image.info.get("icc_profile")
+            if photograph and image.mode not in ("L", "RGB"):
+                # The profile says what the colours of the other kind meant.
+                image, profile = image.convert("RGB"), None
+            elif not photograph:
+                # One colour that stands for "see through" would be blended with its
+                # neighbours, so a picture that has one gets a channel for it first.
+                clear = "A" in image.mode or "transparency" in image.info
+                if image.mode != ("RGBA" if clear else "RGB") and image.mode not in ("L", "LA"):
+                    image = image.convert("RGBA" if clear else "RGB")
+                elif clear and image.mode == "L":
+                    image = image.convert("LA")
+            small = image.resize(size, Image.Resampling.LANCZOS, reducing_gap=2.0)
+            if photograph:
+                # A camera held upright says so beside the picture, and that note is
+                # not copied. Chromium follows it in a JPEG, so the copy is turned.
+                small = ImageOps.exif_transpose(small)
+                copy = copy.with_suffix(".jpg")
+                small.save(copy, "JPEG", quality=85, icc_profile=profile)
+            else:
+                # Packed in a hurry: Chromium unpacks it again in a moment.
+                copy = copy.with_suffix(".png")
+                small.save(copy, "PNG", compress_level=1, icc_profile=profile)
+        except Exception:
+            return path
+    return copy
+
+
+def picture_in(folder, scratch, allowed):
+    """Makes the function that turns what a picture is called in the Markdown into the
+    address Chromium loads it from: a file on this machine, and nothing else.
+
+    The agent reads any file here without asking, so which file it is does not matter.
+    An address on the web does: fetching it would tell a server of the agent's choosing
+    whatever the address says, and nobody would have been asked.
+
+    A picture of more than `allowed` pixels is loaded from a smaller copy in `scratch`.
+    """
+    made = {}
+
+    def picture(source):
+        advice = "Save it next to the Markdown file and write its file name, or take it out"
+        try:
+            address = urlsplit(source)
+        except ValueError:
+            raise Problem(f"there is no picture at {source}. {advice}") from None
+        if address.scheme == "file":
+            source = unquote(address.path)
+        elif address.netloc or len(address.scheme) > 1:
+            raise Problem(f"a picture has to be a file in /work, and {source} is not. {advice}")
+        # A name may be written with %20 for a space, or with the space.
+        for name in (source, unquote(source)):
+            if name and (folder / name).is_file():
+                path = (folder / name).resolve()
+                if path not in made:
+                    made[path] = fitted(path, allowed, scratch / f"picture-{len(made) + 1}")
+                return made[path].as_uri()
+        raise Problem(f"there is no picture at {source}. {advice}")
+
+    return picture
+
+
+# The page may show pictures that are files here and use the styles written into it.
+# Scripts, frames and anything from the network are refused by Chromium itself, should
+# one ever get past `Page`.
+POLICY = "default-src 'none'; img-src file:; style-src 'unsafe-inline'"
+
+
+def page(text, title, folder, style, scratch):
+    """The whole web page for a Markdown document whose pictures are in `folder`.
+    Smaller copies of those that are too large for Chromium are written to `scratch`."""
+    written = to_html(text)
+    pictures = len(re.findall(r"(?i)<img\b", written))
+    body = Page(picture_in(folder, scratch, min(EACH, IN_ALL // max(pictures, 1))))
+    body.feed(written)
+    body.close()
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="{POLICY}">
+<title>{html.escape(title)}</title>
+<style>
+{style}
+</style>
+</head>
+<body>
+{"".join(body.out)}
+</body>
+</html>
+"""
+
+
+# ---------------------------------------------------------------------------------------
+# Printing
+# ---------------------------------------------------------------------------------------
+
+
+def print_pdf(source, pdf, scratch):
+    """Has Chromium print the page at `source` into `pdf`. `scratch` is a directory of
+    its own for everything it writes besides."""
+    browser = next(filter(None, map(shutil.which, BROWSERS)), None)
+    if not browser:
+        raise Problem("Chromium is not installed, so no PDF can be made here")
+    options = [
+        "--headless",
+        "--no-first-run",
+        "--disable-extensions",
+        "--disable-gpu",
+        # A container's /dev/shm is too small for it.
+        "--disable-dev-shm-usage",
+        # Chromium fetches updates and settings for itself when it starts. The page
+        # needs nothing from the network, so no name is looked up at all.
+        "--disable-background-networking",
+        "--disable-component-update",
+        "--host-resolver-rules=MAP * ~NOTFOUND",
+        # Its profile is of no use after this one page, and must not end up in $HOME.
+        f"--user-data-dir={scratch / 'profile'}",
+        # Page numbers come from the style sheet. Chromium's own footer would add the
+        # date and the path of the page. The second spelling is for older versions.
+        "--no-pdf-header-footer",
+        "--print-to-pdf-no-header",
+        # The headings become the PDF's table of contents.
+        "--generate-pdf-document-outline",
+        f"--print-to-pdf={pdf}",
+        source.as_uri(),
+    ]
+    # Chromium's sandbox needs the kernel to let an ordinary user make namespaces, and a
+    # container often does not. It is used where it works. Without it the container is
+    # what holds a page in, and the page is one written here, with no script in it.
+    for sandbox in ([], ["--no-sandbox"]):
+        pdf.unlink(missing_ok=True)
+        # In a session of its own, so that all of its processes can be ended together.
+        with subprocess.Popen(
+            [browser, *sandbox, *options],
+            cwd=scratch,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            errors="replace",
+            start_new_session=True,
+        ) as chromium:
+            try:
+                said, _ = chromium.communicate(timeout=PRINT_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                said = f"Chromium had not finished after {PRINT_TIMEOUT} seconds"
+            finally:
+                # Also when this script is interrupted: none of them may stay behind.
+                try:
+                    os.killpg(chromium.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        if chromium.returncode == 0 and pdf.is_file() and pdf.stat().st_size:
+            return
+    # Why it failed is for whoever runs the service. The agent can do nothing about it.
+    print("\n".join(said.splitlines()[-8:]), file=sys.stderr)
+    raise Problem(
+        "Chromium could not make the PDF. The Markdown file is not at fault. "
+        "Tell the user that the PDF could not be made"
+    )
+
+
+def put(pdf, target):
+    """Moves a finished PDF to its place in the output directory, in one step.
+
+    Everything in that directory is sent to the user, so a PDF only appears there
+    whole: one that failed halfway leaves nothing behind, nor does it cut short an
+    earlier one of the same name.
+    """
+    try:
+        os.replace(pdf, target)
+    except OSError as error:
+        # The two are on different disks only where this is tried out by hand.
+        if error.errno != errno.EXDEV:
+            raise
+        part = target.with_name(f".{target.name}.part")
+        shutil.copyfile(pdf, part)
+        os.replace(part, target)
+
+
+def pages(pdf):
+    """The page count for the last line, as " (3 pages)", or nothing if it is not known."""
+    try:
+        info = subprocess.run(["pdfinfo", str(pdf)], capture_output=True, text=True).stdout
+    except OSError:
+        return ""
+    count = re.search(r"^Pages:\s+(\d+)", info, re.MULTILINE)
+    if not count:
+        return ""
+    return " (1 page)" if count[1] == "1" else f" ({count[1]} pages)"
+
+
+def stop(signum, frame):
+    """Leaves through the `finally` blocks, which end Chromium and remove its files."""
+    sys.exit(128 + signum)
+
+
+def main(args):
+    if not 1 <= len(args) <= 2:
+        print("usage: md2pdf INPUT.md [OUTPUT.pdf]", file=sys.stderr)
+        return 2
+    source = Path(args[0])
+    if not source.is_file():
+        raise Problem(f"no such file: {source}")
+    name = args[1].rpartition("/")[2] if len(args) == 2 else source.stem + ".pdf"
+    if name in ("", ".", ".."):
+        raise Problem(f"not a name for the PDF: {args[1]}")
+    target = OUT_DIR / name
+
+    for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+        signal.signal(signum, stop)
+    # Chromium ends by crashing where it finds no sandbox, before it is started again
+    # without one. That must not write a core file hundreds of megabytes large.
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+
+    text = source.read_text(encoding="utf-8-sig", errors="replace")
+    style = (HOME / "style.css").read_text(encoding="utf-8")
+    # Nothing but the PDF is written under /work, which is saved with the conversation.
+    with tempfile.TemporaryDirectory(prefix="md2pdf-") as scratch:
+        scratch = Path(scratch)
+        document = page(text, source.stem, source.resolve().parent, style, scratch)
+        (scratch / "document.html").write_text(document, encoding="utf-8")
+        print_pdf(scratch / "document.html", scratch / "document.pdf", scratch)
+        OUT_DIR.mkdir(parents=True, exist_ok=True)
+        put(scratch / "document.pdf", target)
+
+    print(
+        f"wrote {target}{pages(target)}; the user receives it when you finish, "
+        "so there is nothing to move or copy"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except (Problem, OSError) as problem:
+        print(f"md2pdf: {problem}", file=sys.stderr)
+        sys.exit(1)
