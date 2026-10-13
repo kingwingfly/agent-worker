@@ -2148,16 +2148,10 @@ impl Inner {
             Some(text) if !result.is_error => (render::DONE, render::answer(text)),
             _ if turn.stop_requested => (render::STOPPED, vec!["⏹ Stopped.".to_owned()]),
             None if !result.is_error => (render::DONE, vec!["(no answer)".to_owned()]),
-            detail => {
-                let mut message = format!(
-                    "⚠️ The agent stopped early ({}).",
-                    render::escape(&result.subtype)
-                );
-                if let Some(detail) = detail {
-                    message.push_str(&format!("\n<pre>{}</pre>", render::escape(detail)));
-                }
-                (render::FAILED, vec![message])
-            }
+            detail => (
+                render::FAILED,
+                vec![render::failure(&result.subtype, detail)],
+            ),
         };
         if self.is_guest() {
             return self.report_as_guest(&bot, turn, result, &messages).await;

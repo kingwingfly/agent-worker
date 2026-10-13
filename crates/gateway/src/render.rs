@@ -56,6 +56,13 @@ pub const DONE: &str = "✅ Done";
 pub const STOPPED: &str = "⏹ Stopped";
 pub const FAILED: &str = "⚠️ Stopped early";
 
+/// How much is shown of what a failed turn said: of each of its lines, and in all. A
+/// process that crashes can print pages, with a line of the program it crashed in that
+/// is longer than a message may be, and a message Telegram refuses for its length tells
+/// the chat nothing at all.
+const FAILURE_LINE_CHARS: usize = 300;
+const FAILURE_CHARS: usize = 1500;
+
 pub fn escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
@@ -314,6 +321,22 @@ pub fn answer(markdown: &str) -> Vec<String> {
     }
     flush(&mut current, &mut messages);
     messages
+}
+
+/// What a chat is told about a turn that ended in an error: which kind it was and, if
+/// the agent or its runner said more, the start of that. Lines are cut before the whole
+/// is, so that one long line does not push out what the next ones say.
+pub fn failure(subtype: &str, detail: Option<&str>) -> String {
+    let mut message = format!("⚠️ The agent stopped early ({}).", escape(subtype));
+    if let Some(detail) = detail {
+        let lines: Vec<String> = detail
+            .lines()
+            .map(|line| truncate(line, FAILURE_LINE_CHARS))
+            .collect();
+        let shown = truncate(&lines.join("\n"), FAILURE_CHARS);
+        message.push_str(&format!("\n<pre>{}</pre>", escape(&shown)));
+    }
+    message
 }
 
 /// The text Claude is writing, as a draft shows it while it grows: the last of the
@@ -1471,6 +1494,35 @@ mod tests {
         for piece in split_text(&text, 23) {
             assert_eq!(piece.len() % 5, 0, "{piece}");
         }
+    }
+
+    #[test]
+    fn what_a_failed_turn_said_is_cut_to_fit_a_message() {
+        assert_eq!(
+            failure("error_max_turns", None),
+            "⚠️ The agent stopped early (error_max_turns)."
+        );
+        assert_eq!(
+            failure(
+                "runner_error",
+                Some("claude exited: exit status: 1\n<oops>")
+            ),
+            "⚠️ The agent stopped early (runner_error).\n\
+             <pre>claude exited: exit status: 1\n&lt;oops&gt;</pre>"
+        );
+
+        // A crash prints the line of the program it happened in, which can be any
+        // length, then what went wrong, then where.
+        let dump = format!(
+            "claude exited: exit status: 1\n{}\nTypeError: 𝑥 is not a function\n{}",
+            "𝑥".repeat(20_000),
+            "    at somewhere\n".repeat(200),
+        );
+        let message = failure("runner_error", Some(&dump));
+        assert!(units(&message) <= MESSAGE_LIMIT, "{}", units(&message));
+        assert!(message.contains("claude exited: exit status: 1\n𝑥𝑥"));
+        assert!(message.contains("𝑥…\nTypeError: 𝑥 is not a function\n    at somewhere"));
+        assert!(message.ends_with("…</pre>"));
     }
 
     #[test]
