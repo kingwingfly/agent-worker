@@ -101,16 +101,25 @@ impl Child {
         self.exit.borrow().clone()
     }
 
-    /// Blocks until something accepts connections on `addr`. Fails if the MCP server
-    /// ends first or takes longer than `timeout`.
-    pub fn wait_until_listening(&self, addr: SocketAddr, timeout: Duration) -> anyhow::Result<()> {
+    /// Blocks until something accepts connections on `addr`, or until `asked` says that
+    /// this process was told to stop, and returns which: whether something listens.
+    /// Fails if the MCP server ends first or takes longer than `timeout`.
+    pub fn wait_until_listening(
+        &self,
+        addr: SocketAddr,
+        timeout: Duration,
+        asked: &crate::Asked,
+    ) -> anyhow::Result<bool> {
         let deadline = Instant::now() + timeout;
         loop {
+            if *asked.borrow() {
+                return Ok(false);
+            }
             if let Some(how) = self.exited() {
                 anyhow::bail!("the MCP server stopped before it was listening ({how})");
             }
             if TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok() {
-                return Ok(());
+                return Ok(true);
             }
             anyhow::ensure!(
                 Instant::now() < deadline,

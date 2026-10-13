@@ -317,3 +317,25 @@ async fn stopping_the_front_stops_the_mcp_server() {
     assert!(front.exit().await.success());
     until("the MCP server to be gone", || !running()).await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_front_stopped_while_its_mcp_server_is_starting_stops_it_too() {
+    let pid_file = tempfile::NamedTempFile::new().unwrap();
+    let script = format!("echo $$ > {}; exec sleep 60", pid_file.path().display());
+    // Nothing ever listens where this MCP server is expected, so the front keeps waiting.
+    let mut front = Front::start(&["sh", "-c", &script]);
+    let pid = || {
+        fs::read_to_string(pid_file.path())
+            .unwrap()
+            .trim()
+            .to_owned()
+    };
+    until("the MCP server to start", || !pid().is_empty()).await;
+    let pid = pid();
+    let running = || Path::new("/proc").join(&pid).exists();
+    assert!(running());
+
+    front.terminate();
+    assert!(front.exit().await.success());
+    until("the MCP server to be gone", || !running()).await;
+}
