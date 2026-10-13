@@ -95,6 +95,11 @@ RUN python3 -c 'import json; s = json.load(open("/etc/agent/settings.json")); as
 ENV HOME=/home/agent \
     PATH=/home/agent/.local/bin:/usr/local/bin:/usr/bin:/bin \
     CLAUDE_CONFIG_DIR=/home/agent/.claude
+# Claude Code's installer is piped into a shell further up, and a pipe ends well if its
+# last command does: a download that failed leaves an image without Claude Code, in which
+# every turn ends at "failed to start claude". It is looked for the way the runner finds
+# it, on the PATH above.
+RUN command -v claude > /dev/null || { echo "Claude Code was not installed" >&2; exit 1; }
 # Last, so that it covers every COPY above: fail the build, not every request, if the
 # agent has been given a file it cannot read. COPY makes a file root's whichever USER
 # is in effect, and keeps the mode it has in the checkout.
