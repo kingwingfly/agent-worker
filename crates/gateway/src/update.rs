@@ -102,6 +102,18 @@ pub fn retry_after(refusal: &str) -> Option<u64> {
     rest.strip_prefix(RETRY_AFTER)?.trim().parse().ok()
 }
 
+/// How a user the allow-list leaves out is told so, which depends on the update they
+/// caused.
+#[derive(Debug, PartialEq, Eq)]
+pub enum TurnedAway<'a> {
+    /// With a message in the chat of that id, which is theirs with the bot.
+    InChat(i64),
+    /// With the one reply the guest summons of this id gets.
+    InReply(&'a str),
+    /// Over the button whose press has this id, where only they see it.
+    OverButton(&'a str),
+}
+
 /// Where an update belongs and who caused it.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Origin {
@@ -173,6 +185,29 @@ impl Update {
     }
 }
 
+impl Update {
+    /// How the user who caused this update is told that the bot is not theirs to use,
+    /// if they are told at all.
+    ///
+    /// A message is answered only in a private chat. In a group the bot may be handed
+    /// every message, and would answer each one of everybody the list leaves out, in
+    /// front of all the others. Nobody waits for an answer to a press on a draft's Stop
+    /// button either.
+    pub fn turned_away(&self) -> Option<TurnedAway<'_>> {
+        if let Some(message) = &self.message {
+            return message
+                .chat
+                .is_private()
+                .then_some(TurnedAway::InChat(message.chat.id));
+        }
+        if let Some(message) = &self.guest_message {
+            return message.guest_query_id.as_deref().map(TurnedAway::InReply);
+        }
+        let query = self.callback_query.as_ref()?;
+        Some(TurnedAway::OverButton(&query.id))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,6 +221,44 @@ mod tests {
             session: session.into(),
             user_id,
         })
+    }
+
+    #[test]
+    fn a_group_is_not_told_that_one_of_its_members_is_not_let_in() {
+        let message = |kind: &str| {
+            update(&format!(
+                r#"{{"update_id":1,"message":{{"message_id":5,"date":0,
+                    "chat":{{"id":42,"type":"{kind}"}},
+                    "from":{{"id":7,"is_bot":false,"first_name":"A"}},"text":"hi"}}}}"#
+            ))
+        };
+        assert_eq!(
+            message("private").turned_away(),
+            Some(TurnedAway::InChat(42))
+        );
+        for kind in ["group", "supergroup", "channel"] {
+            assert_eq!(message(kind).turned_away(), None, "{kind}");
+        }
+
+        // Whoever summons the bot or presses one of its buttons asked it something, and
+        // the answer is one reply, or a note only they see.
+        let summons = update(
+            r#"{"update_id":2,"guest_message":{"message_id":5,"date":0,
+                "chat":{"id":-42,"type":"supergroup"},"guest_query_id":"gq",
+                "from":{"id":7,"is_bot":false,"first_name":"A"},"text":"@bot hi"}}"#,
+        );
+        assert_eq!(summons.turned_away(), Some(TurnedAway::InReply("gq")));
+        let press = update(
+            r#"{"update_id":3,"callback_query":{"id":"cb","data":"x",
+                "from":{"id":7,"is_bot":false,"first_name":"A"},
+                "message":{"message_id":5,"date":0,"chat":{"id":-42,"type":"group"}}}}"#,
+        );
+        assert_eq!(press.turned_away(), Some(TurnedAway::OverButton("cb")));
+        let stopped = update(
+            r#"{"update_id":4,"stopped_message_generation":{"chat":{"id":7,"type":"private"},
+                "draft_id":3}}"#,
+        );
+        assert_eq!(stopped.turned_away(), None);
     }
 
     #[test]

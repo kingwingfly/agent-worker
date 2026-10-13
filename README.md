@@ -154,7 +154,7 @@ With podman, put `WRANGLER_DOCKER_BIN="$PWD/containers/docker-via-podman"` in fr
      -d 'allowed_updates=["message","callback_query","guest_message","stopped_message_generation"]'
    ```
    Telegram sends only the kinds of update named here. A webhook registered before the last two existed has to be registered again, or the bot never hears a guest summons or a press on a draft's Stop button. The answer does not say which kinds are in force: for an address and secret it already has, it is "Webhook is already set" whether or not the list changed. `curl "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/getWebhookInfo"` shows them under `allowed_updates`. If `curl` ends with `URL rejected` after printing the answer, a space got in behind one of the backslashes when the command was pasted, and whatever followed it was not sent.
-5. Message the bot. If you are not on the allow-list it replies with your user id; add it to `ALLOWED_TG_USERS` and deploy again.
+5. Message the bot in a private chat. If you are not on the allow-list it replies with your user id; add it to `ALLOWED_TG_USERS` and deploy again. In a group it says nothing to a message of someone the list leaves out: there it may be handed every message, and would answer each of them in front of everybody.
 6. To let the bot be summoned in chats it is not a member of, open its settings in @BotFather and switch on Guest Mode. Nothing has to be configured here for it; see "As a guest in other chats".
 
 ### The LLM gateway
