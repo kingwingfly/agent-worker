@@ -63,6 +63,12 @@ const DRAFT_INTERVAL_MS: u64 = 500;
 /// Stream events between acknowledgments. Prompts and results are acknowledged at once.
 const ACK_EVERY: u32 = 64;
 const MAX_DRIVE_FAILURES: u32 = 4;
+/// How many runners a turn is handed to before it is given up on. Each but the first is
+/// one that took the place of a container which went away with the turn unfinished, and
+/// starts on the message from its beginning. A turn that takes more memory than a
+/// container has would otherwise be run again for as long as a turn may take, each run
+/// spending tokens and doing over what the last one did.
+const MAX_TURN_RUNS: u32 = 3;
 const READY_POLL_MS: u64 = 300;
 const READY_ATTEMPTS: u32 = 100;
 const TOKEN_TTL_SECS: u64 = 24 * 60 * 60;
@@ -300,7 +306,8 @@ struct Turn {
     /// scrolled up the chat.
     #[serde(default)]
     status_buried: bool,
-    /// The message has been handed to the runner, so stopping means interrupting it.
+    /// The message has been handed to the runner there is now, so stopping means
+    /// interrupting it. A runner that takes another's place has yet to be given it.
     #[serde(default)]
     delivered: bool,
     #[serde(default)]
@@ -308,6 +315,9 @@ struct Turn {
     /// Consecutive failed attempts to get the turn to the runner.
     #[serde(default)]
     failures: u32,
+    /// How many runners the message was handed to, see [`MAX_TURN_RUNS`].
+    #[serde(default)]
+    runs: u32,
     /// For a guest's turn, the reply its summons got: the one message all of the turn is
     /// shown in. It is taken out when the message gets its last form.
     #[serde(default)]
@@ -789,6 +799,7 @@ impl Inner {
                 delivered: false,
                 stop_requested: false,
                 failures: 0,
+                runs: 0,
                 guest_reply: None,
                 draft_id: if session.private { new_draft_id() } else { 0 },
             });
@@ -1252,11 +1263,22 @@ impl Inner {
         }
 
         // Read the turn again: `/stop` may have ended it during the awaits above, or the
-        // runner may have. From here to the end nothing awaits, so the turn cannot
-        // change under this either.
+        // runner may have. From here to the end nothing awaits while the turn goes on,
+        // so it cannot change under this either.
         let Some(turn) = self.turn_to_drive() else {
             return Ok(());
         };
+        if !turn.delivered && turn.runs >= MAX_TURN_RUNS {
+            // The last of the runners it was handed to is gone like the ones before.
+            let message = format!(
+                "⚠️ The agent broke down {} times while working on this and was started \
+                 again from your message each time, so I ended it. Some of it may have \
+                 been done more than once.",
+                turn.runs
+            );
+            self.abandon_turn(&message).await;
+            return Ok(());
+        }
         // The runner ignores a turn it already has, so repeating this is harmless.
         let handed_over = self.send(&ToRunner::UserMessage {
             turn_id: turn.id,
@@ -1271,6 +1293,9 @@ impl Inner {
         }
         self.update(|session| {
             if let Some(turn) = &mut session.turn {
+                if !turn.delivered {
+                    turn.runs += 1;
+                }
                 turn.delivered = true;
                 turn.failures = 0;
             }
@@ -1331,7 +1356,13 @@ impl Inner {
                 // The runner's own word that it is new. `start_container` records the
                 // same thing, but a runner can also be replaced without this object
                 // starting it, as a hand-started one is.
-                self.update(|session| session.needs_restore = session.has_state);
+                self.update(|session| {
+                    session.needs_restore = session.has_state;
+                    // Nor has it the turn, whatever runner had it before.
+                    if let Some(turn) = &mut session.turn {
+                        turn.delivered = false;
+                    }
+                });
                 // Prompts the previous runner was waiting on died with it.
                 let closed = self
                     .close_approvals(&Bot::new(cfg), false, "The agent was restarted.")

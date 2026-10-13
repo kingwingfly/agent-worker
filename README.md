@@ -44,7 +44,7 @@ The state saved after each turn is a checkpoint of its own: the transcript and `
 
 All three replace the container, so the next message starts one from the checkpoint. A chat keeps its 10 most recently used conversations and each conversation its 10 newest checkpoints, which is 9 turns that can be undone (`CONVERSATIONS_KEPT` and `CHECKPOINTS_KEPT` in `session.rs`); older ones are deleted from R2. Nothing deletes a conversation on request.
 
-An alarm re-checks every 30 seconds while a turn is open, so an evicted Durable Object or a crashed container is picked up and the turn is run again. A new container is given the saved state before it runs anything; if that fails the turn is refused rather than run on an empty disk, and the saved copy is left as it is.
+An alarm re-checks every 30 seconds while a turn is open, so an evicted Durable Object or a crashed container is picked up and the turn is run again. A turn is run in three containers at most (`MAX_TURN_RUNS` in `session.rs`): when the third goes away too, as happens to a task that needs more memory than a container has, the turn ends and the chat is told. A new container is given the saved state before it runs anything; if that fails the turn is refused rather than run on an empty disk, and the saved copy is left as it is.
 
 ### Long conversations
 
