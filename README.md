@@ -36,7 +36,7 @@ Telegram ──webhook──▶ Worker
 
 ### Conversations and going back
 
-The state saved after each turn is a checkpoint of its own: the transcript and `/work` as they were then, at `sessions/<chat>/<conversation>/<time>.tar.gz`. That is what the bot's three commands for conversations work on.
+The state saved after each turn is a checkpoint of its own: the transcript and `/work` as they were then, at `sessions/<chat>/<conversation>/<time>.tar.gz`. Files, directories and links are in it; a socket or a pipe that a program left in `/work`, and a file its own user may not read, are left out and named in the runner's log. That is what the bot's three commands for conversations work on.
 
 - `/rewind` lists your recent messages. Picking one puts the conversation and the files back to how they were before you sent it; that turn and the later ones are forgotten and their archives deleted.
 - `/new` starts an empty conversation and keeps the one you leave.
