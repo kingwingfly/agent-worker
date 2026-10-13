@@ -1962,7 +1962,7 @@ impl Inner {
         }
         let callback = data.and_then(Callback::parse);
         let approval = match &callback {
-            Some(callback) => self.store.approval(callback.request_id())?,
+            Some(callback) => self.open_prompt(callback.request_id())?,
             None => None,
         };
         // A guest's session is that of the user it answers, so nobody else's press gets
@@ -2045,11 +2045,27 @@ impl Inner {
             let retry = "I couldn't reach the agent just now. Please press again in a moment.";
             return bot.answer_callback(&query.id, Some(retry)).await;
         }
-        let _ = bot.answer_callback(&query.id, None).await;
-        self.store.delete_approval(&approval.request_id)?;
-        if always && let Some(key) = remember::key(&approval.tool_name, &approval.input) {
-            self.store.remember(&key)?;
+        // Reaching the runner can take a reconnection, and by the end of one the prompt
+        // may be closed: by another press, by its deadline, by the end of its turn, or
+        // because the runner turned out to be a new one that never asked.
+        if self.open_prompt(&approval.request_id)?.is_none() {
+            return bot.answer_callback(&query.id, Some(gone(&query))).await;
         }
+        // Recorded before anything else is awaited. A second press that arrived
+        // meanwhile would find the prompt still open, and the runner has taken this
+        // answer: the prompt would be marked with the other one, and "Always"
+        // remembered for a request that was declined.
+        let recorded = self
+            .store
+            .delete_approval(&approval.request_id)
+            .and_then(
+                |()| match remember::key(&approval.tool_name, &approval.input) {
+                    Some(key) if always => self.store.remember(&key),
+                    _ => Ok(()),
+                },
+            );
+        let _ = bot.answer_callback(&query.id, None).await;
+        recorded?;
         // A guest's prompt was shown in the reply, which the progress takes back below.
         let edited = if guest {
             Ok(())
@@ -2062,6 +2078,17 @@ impl Inner {
         // With the prompt answered, the progress is what to watch again.
         self.redraw_status().await;
         edited
+    }
+
+    /// The prompt a press answers, while there is something to answer: it is on record,
+    /// and the turn it was asked in is the runner's to work on. At the end of a turn the
+    /// runner answers what is still open itself, and the prompt stays on record only
+    /// until the report of that turn gets to it. A press in that time, taken for an
+    /// answer, would mark as allowed what was declined.
+    fn open_prompt(&self, request_id: &str) -> Result<Option<Approval>> {
+        let turn = self.turn_to_drive();
+        let approval = self.store.approval(request_id)?;
+        Ok(approval.filter(|approval| turn.is_some_and(|turn| turn.id == approval.turn_id)))
     }
 
     /// Gets a decision to the runner, reconnecting first if this object was evicted
