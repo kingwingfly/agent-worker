@@ -1,11 +1,12 @@
 //! Runs the real `mcp-front` binary with a stand-in MCP server behind it.
 
 use std::{
+    collections::BTreeSet,
     fs,
     net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream},
     path::Path,
     process::{Child, Command, ExitStatus, Stdio},
-    sync::Arc,
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
     time::{Duration, Instant},
 };
 
@@ -19,9 +20,40 @@ use tokio::sync::Notify;
 
 const WAIT: Duration = Duration::from_secs(10);
 
+/// The ports the tests were given so far. Whoever holds this may try a port, which is
+/// done by listening on it for a moment, or start a process, and nobody does the other
+/// meanwhile; see [`free_addr`].
+fn ports() -> MutexGuard<'static, BTreeSet<u16>> {
+    static PORTS: Mutex<BTreeSet<u16>> = Mutex::new(BTreeSet::new());
+    // A test that failed while it held this is no reason for the others to fail.
+    PORTS.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// An address nothing listens on, and that no test here was given before.
+///
+/// The tests run side by side, which gets in the way of that twice. The kernel hands a
+/// port that one test has just let go to the next that asks, so two fronts would take
+/// each other's servers for their own: hence the record of what was given. And a
+/// process started by another test at this very moment takes a copy of the listener the
+/// port is tried with, and keeps it until it runs its own program, so that something
+/// listens on the port a little longer and whoever was given it finds it taken, or
+/// takes it for a front that is up: hence [`launch`].
 fn free_addr() -> SocketAddr {
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    listener.local_addr().unwrap()
+    let mut given = ports();
+    loop {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        if given.insert(addr.port()) {
+            return addr;
+        }
+    }
+}
+
+/// Starts a process while no port is being tried. It is running its own program, with
+/// none of this one's sockets, by the time this returns.
+fn launch(command: &mut Command) -> std::io::Result<Child> {
+    let _ports = ports();
+    command.spawn()
 }
 
 fn accepts_connections(addr: SocketAddr) -> bool {
@@ -95,7 +127,8 @@ impl Front {
     fn start(command: &[&str]) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let (addr, mcp) = (free_addr(), free_addr());
-        let process = Command::new(env!("CARGO_BIN_EXE_mcp-front"))
+        let mut front = Command::new(env!("CARGO_BIN_EXE_mcp-front"));
+        front
             .args(command)
             .env("MCP_FRONT_LISTEN", addr.to_string())
             .env("MCP_FRONT_MCP_ADDR", mcp.to_string())
@@ -106,9 +139,8 @@ impl Front {
             // Its MCP server inherits these, and must not hold on to the test's own.
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::piped());
+        let process = launch(&mut front).unwrap();
         Self {
             process,
             addr,
@@ -168,7 +200,9 @@ impl Front {
     /// Asks the front to stop the way a container runtime does.
     fn terminate(&self) {
         let pid = self.process.id().to_string();
-        let _ = Command::new("kill").args(["-TERM", &pid]).status();
+        if let Ok(mut kill) = launch(Command::new("kill").args(["-TERM", &pid])) {
+            let _ = kill.wait();
+        }
     }
 }
 
