@@ -7,6 +7,10 @@
 # to serve MCP over streamable HTTP at /mcp on the address in MCP_FRONT_MCP_ADDR
 # (127.0.0.1:8081 unless you set it), and save any file an agent should be able to fetch
 # under MCP_FRONT_FILES_DIR. The build context is the repository root.
+#
+# Copy no credential in here: whoever can pull the image would have it. Make it a Worker
+# secret and name it in MCP_CONTAINER_ENV (wrangler.toml), and it arrives in the server's
+# environment when the container starts.
 
 FROM rust:1-bookworm AS build
 # pingora builds its zlib with cmake.

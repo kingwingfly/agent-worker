@@ -33,14 +33,22 @@ pub struct McpHostDO {
 }
 
 impl McpHostDO {
-    async fn ensure_ready(&self) -> Result<worker::Fetcher> {
+    async fn ensure_ready(&self, cfg: &Config) -> Result<worker::Fetcher> {
         let container = self
             .state
             .container()
             .ok_or_else(|| error("McpHostDO has no container"))?;
         if !container.running() {
             self.ready.set(false);
-            container_ext::start(&container, &[])?;
+            // Read at every start, so a secret that was changed is in the next container.
+            // A missing one leaves the container stopped: an MCP server without its
+            // credentials would only fail later, at the first tool call.
+            let vars = cfg.mcp_container_vars(&self.env)?;
+            let vars: Vec<(&str, &str)> = vars
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str()))
+                .collect();
+            container_ext::start(&container, &vars)?;
         }
         let port = container.get_tcp_port(MCP_PORT)?;
         if self.ready.get() {
@@ -76,7 +84,8 @@ impl DurableObject for McpHostDO {
     }
 
     async fn fetch(&self, request: Request) -> Result<Response> {
-        let port = match self.ensure_ready().await {
+        let cfg = Config::load(&self.env)?;
+        let port = match self.ensure_ready(&cfg).await {
             Ok(port) => port,
             Err(error) => {
                 console_error!("MCP container: {error}");
@@ -84,10 +93,9 @@ impl DurableObject for McpHostDO {
             }
         };
         // Each request pushes the shutdown out by the idle time.
-        let idle = Config::load(&self.env)?.mcp_idle_ttl_ms;
         self.state
             .storage()
-            .set_alarm(Duration::from_millis(idle))
+            .set_alarm(Duration::from_millis(cfg.mcp_idle_ttl_ms))
             .await?;
         if request.path() == WARM_PATH {
             return Response::empty();
