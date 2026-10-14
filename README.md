@@ -131,6 +131,8 @@ MCP_FRONT_LISTEN=127.0.0.1:8090 MCP_FRONT_FILES_DIR=/tmp/agent/files \
   cargo run -p agent-mcp-front -- target/debug/agent-mcp-example
 ```
 
+`DEV_MCP_URL` goes around the Durable Object that starts the MCP container, so `MCP_CONTAINER_ENV` does nothing there: set your server's credentials in the environment of the `mcp-front` you start.
+
 ## Deploy
 
 Needs a Workers Paid plan, Docker or podman for building the images, and `cargo install worker-build`.
@@ -180,15 +182,19 @@ The port opens only once the MCP server accepts connections, and if the MCP serv
 
 The container's disk and memory are lost when it stops (`MCP_IDLE_TTL_SECS` after the last request). If your server's shared state cannot be rebuilt, persist it elsewhere or keep the container up.
 
-Keep your server's credentials out of the image: whoever can pull an image has what was copied into it. Make each one a secret of this Worker, and list their names in `MCP_CONTAINER_ENV`:
+Keep your server's credentials out of the image: whoever can pull an image has what was copied into it. Make each one a secret of this Worker:
 
 ```sh
 npx wrangler secret put MY_SERVER_TOKEN
-# wrangler.toml, under [vars]:
+```
+
+and list their names, comma separated, in the `MCP_CONTAINER_ENV` line that `wrangler.toml` already has under `[vars]`:
+
+```toml
 MCP_CONTAINER_ENV = "MY_SERVER_TOKEN"
 ```
 
-The MCP container is then started with each of them as an environment variable of the same name, and `mcp-front` passes them on to your server. They are read anew at every start, so a changed secret is in the next container. If one is missing or empty, the container is not started at all: requests get a 503 and the log says which variable is missing. The agent containers get none of them. A credential that is a file has to become text for this, which is at most 5 KB a secret; your server then writes it back to a file when it starts.
+The MCP container is then started with each of them as an environment variable of the same name, and `mcp-front` passes them on to your server. They are read anew at every start, so a changed secret is in the next container; one that is running keeps the values it was started with until it stops. If one is missing, empty or not text, or is one of the Worker's own secrets, the container is not started at all: requests get a 503 and the log says which variable it was. The agent containers get none of them. A credential that is a file has to become text for this, which is at most 5 KB a secret; your server then writes it back to a file when it starts.
 
 #### Files
 
@@ -268,7 +274,7 @@ To try a change without building the image, install Chromium or Chrome and Pytho
 ## Security model
 
 - An agent container holds one credential: a session token that is only accepted by this Worker's `/llm`, `/mcp` and `/file` routes. The gateway key and bot token never leave the Worker.
-- The MCP container holds the MCP server's own credentials, if `MCP_CONTAINER_ENV` names any. They come from the Worker's secrets when it starts, not from its image, so a copy of the image does not carry them. Inside the container they are in the environment of `mcp-front` and the server, and whatever the server writes them to. An agent reaches that container only through the server's tools and `/file`, which serves the one directory the server saves files in. Don't list the Worker's own secrets there: the gateway key would then be in a container that runs someone else's code.
+- The MCP container holds the MCP server's own credentials, if `MCP_CONTAINER_ENV` names any. They come from the Worker's secrets when it starts, not from its image, so a copy of the image does not carry them. Inside the container they are in the environment of `mcp-front` and the server, and whatever the server writes them to. An agent reaches that container only through the server's tools and `/file`, which serves the one directory the server saves files in. The Worker's own secrets are refused there, and the container is not started while one is listed: the gateway key or the key session tokens are signed with would otherwise be in a container that runs someone else's code.
 - The agent can read that token, so holding it is not enough. Before acting on one, the proxy asks the chat's session, which refuses a token that is not the one its running container was started with: a token stops working when its container is stopped or replaced, well before its 24 hours are up. For a model call the session also refuses once the day's budget is used up, and the proxy passes on only the two requests Claude Code makes, for the two configured models. What is left to someone who copies a token out is what the agent itself could do: model calls on the chat's budget and the chat's MCP calls, while the container runs.
 - The runner's control API needs a secret the session sets before any agent process exists, and the runner makes its own memory unreadable to the agent, so the agent cannot approve its own prompts.
 - The permission policy is a root-owned managed settings file. Settings the agent writes in its working directory are not loaded.

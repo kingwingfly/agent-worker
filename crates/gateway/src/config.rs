@@ -116,6 +116,17 @@ fn token_secret(env: &Env) -> Result<String> {
     Ok(value)
 }
 
+/// The secrets `Config::load` reads, which no container may be started with. The MCP
+/// container runs code that acts on what agents send it, and with one of these whoever
+/// controls that code could sign session tokens for any chat, spend the gateway key or
+/// speak as the bot.
+const OWN_SECRETS: [&str; 4] = [
+    "TELEGRAM_BOT_TOKEN",
+    "TELEGRAM_WEBHOOK_SECRET",
+    "LLM_API_KEY",
+    "SESSION_TOKEN_SECRET",
+];
+
 fn seconds(env: &Env, name: &str, default: u64) -> Result<u64> {
     match var(env, name) {
         Some(value) => value
@@ -181,5 +192,40 @@ impl Config {
                 .map(|url| url.trim_end_matches('/').to_owned()),
             dev_mcp_url: var(env, "DEV_MCP_URL").map(|url| url.trim_end_matches('/').to_owned()),
         })
+    }
+
+    /// The environment the MCP container is started with: each name `MCP_CONTAINER_ENV`
+    /// lists, with its value as it is now. A name that is one of the Worker's own secrets,
+    /// or that has no text value, is an error.
+    pub fn mcp_container_vars(&self, env: &Env) -> Result<Vec<(String, String)>> {
+        self.mcp_container_env
+            .iter()
+            .map(|name| {
+                if OWN_SECRETS.contains(&name.as_str()) {
+                    return Err(error(format!(
+                        "{name}, named in MCP_CONTAINER_ENV, is a secret of this Worker, \
+                         which no container may hold"
+                    )));
+                }
+                // `var` reads secrets too. The cause is kept because a variable that is
+                // set to something other than text, such as a number in `[vars]`, is
+                // refused all the same, and "not set" alone would send the operator
+                // looking for a secret that is there.
+                let value = env
+                    .var(name)
+                    .map_err(|cause| {
+                        error(format!(
+                            "{name}, named in MCP_CONTAINER_ENV, is not set as text ({cause})"
+                        ))
+                    })?
+                    .to_string();
+                if value.trim().is_empty() {
+                    return Err(error(format!(
+                        "{name}, named in MCP_CONTAINER_ENV, is empty"
+                    )));
+                }
+                Ok((name.clone(), value))
+            })
+            .collect()
     }
 }
