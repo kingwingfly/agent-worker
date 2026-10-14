@@ -66,6 +66,10 @@ pub struct Config {
     /// Fresh (non cache-read) tokens a chat may use per UTC day. Zero means unlimited.
     pub daily_token_budget: u64,
     pub mcp_idle_ttl_ms: u64,
+    /// Names of this Worker's secrets or variables the MCP container is started with, as
+    /// environment variables of the same name: the MCP server's own credentials, which an
+    /// image would hand to whoever can pull it. Only the names are kept here.
+    pub mcp_container_env: Vec<String>,
     /// Development only: a runner started by hand that every session uses in place of
     /// its container, e.g. `http://127.0.0.1:8080`. See the README.
     pub dev_runner_url: Option<String>,
@@ -163,6 +167,16 @@ impl Config {
                 None => 0,
             },
             mcp_idle_ttl_ms: seconds(env, "MCP_IDLE_TTL_SECS", 900)?,
+            mcp_container_env: var(env, "MCP_CONTAINER_ENV")
+                .map(|names| {
+                    names
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|name| !name.is_empty())
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default(),
             dev_runner_url: var(env, "DEV_RUNNER_URL")
                 .map(|url| url.trim_end_matches('/').to_owned()),
             dev_mcp_url: var(env, "DEV_MCP_URL").map(|url| url.trim_end_matches('/').to_owned()),

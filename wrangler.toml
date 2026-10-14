@@ -42,6 +42,9 @@ TURN_TIMEOUT_SECS = "1800"
 # or one user's summons of the bot as a guest in one chat.
 DAILY_TOKEN_BUDGET = "0"
 MCP_IDLE_TTL_SECS = "900"
+# Names of secrets (or variables) the MCP container is started with, comma separated:
+# the MCP server's credentials, which must not be in its image.
+MCP_CONTAINER_ENV = ""
 
 [[durable_objects.bindings]]
 name = "SESSION"

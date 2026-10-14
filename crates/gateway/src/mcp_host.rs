@@ -40,7 +40,28 @@ impl McpHostDO {
             .ok_or_else(|| error("McpHostDO has no container"))?;
         if !container.running() {
             self.ready.set(false);
-            container_ext::start(&container, &[])?;
+            // Read at every start, so a secret that was changed is in the next container.
+            // A missing one leaves the container stopped: an MCP server without its
+            // credentials would only fail later, at the first tool call.
+            let mut vars = Vec::new();
+            for name in Config::load(&self.env)?.mcp_container_env {
+                let value = self
+                    .env
+                    .secret(&name)
+                    .or_else(|_| self.env.var(&name))
+                    .map(|value| value.to_string())
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| {
+                        error(format!("{name}, named in MCP_CONTAINER_ENV, is not set"))
+                    })?;
+                vars.push((name, value));
+            }
+            let vars: Vec<(&str, &str)> = vars
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str()))
+                .collect();
+            container_ext::start(&container, &vars)?;
         }
         let port = container.get_tcp_port(MCP_PORT)?;
         if self.ready.get() {
