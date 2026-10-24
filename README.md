@@ -110,16 +110,22 @@ cargo run -p agent-runner --example drive -- "Create out/hello.md containing one
 
 ### Run the Worker without a container engine
 
-`wrangler dev` needs Docker to run containers. To work on the Worker and session logic without it, start a runner by hand and point every session at it:
+`wrangler dev` needs Docker to run containers. To work on the Worker and session logic without it, put the secrets in `.dev.vars`, start a runner by hand and point every session at it:
 
 ```sh
+cat > .dev.vars <<'EOF'
+TELEGRAM_BOT_TOKEN=…
+TELEGRAM_WEBHOOK_SECRET=…
+LLM_API_KEY=…
+SESSION_TOKEN_SECRET=…
+EOF
 RUNNER_LISTEN=127.0.0.1:8080 RUNNER_WORK_DIR=/tmp/agent/work RUNNER_RUNTIME_DIR=/tmp/agent/run \
   cargo run -p agent-runner &
 npx wrangler dev --enable-containers=false \
-  --var DEV_RUNNER_URL:http://127.0.0.1:8080 --var ALLOWED_TG_USERS:'*' \
-  --var TELEGRAM_BOT_TOKEN:… --var TELEGRAM_WEBHOOK_SECRET:… \
-  --var LLM_API_KEY:… --var SESSION_TOKEN_SECRET:…
+  --var DEV_RUNNER_URL:http://127.0.0.1:8080 --var ALLOWED_TG_USERS:'*'
 ```
+
+Git ignores `.dev.vars`. Secrets given with `--var` instead work too, but `wrangler dev` then warns that the ones `[secrets]` in `wrangler.toml` requires are missing. Without a `.dev.vars` it looks for them in the shell's environment, and there a variable with the name of one under `[vars]` takes that one's place.
 
 `DEV_RUNNER_URL` is for development only: every session is sent to that one runner, and nothing replaces it. A runner belongs to the session that claimed it first, so to try another chat, or a guest's session next to a chat's, restart it; a second session is told that the runner belongs to an earlier start. `/new`, `/resume` and `/rewind` only take effect on it once you restart it with an empty working directory and `AGENT_CLAUDE_SESSION_ID` set to the conversation's id. `TELEGRAM_API_BASE` redirects Bot API calls, for a mock or a self-hosted Bot API server.
 
@@ -148,7 +154,7 @@ With podman, put `WRANGLER_DOCKER_BIN="$PWD/containers/docker-via-podman"` in fr
    npx wrangler secret put LLM_API_KEY
    npx wrangler secret put SESSION_TOKEN_SECRET      # a random string of 16 characters or more
    ```
-3. `npx wrangler deploy`. The first deploy builds and pushes both images, which takes a few minutes. The agent image sets the modes of the files it takes from the checkout itself, so you can close `containers/agent/system.md` or a skill to the other users of the machine you build on; the agent, which is not root in its container, reads them all the same.
+3. `npx wrangler deploy`. It refuses to deploy while a secret named under `[secrets]` in `wrangler.toml` is not set. The first deploy builds and pushes both images, which takes a few minutes. The agent image sets the modes of the files it takes from the checkout itself, so you can close `containers/agent/system.md` or a skill to the other users of the machine you build on; the agent, which is not root in its container, reads them all the same.
 4. Register the webhook with the same secret:
    ```sh
    curl "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/setWebhook" \
@@ -192,6 +198,19 @@ and list their names, comma separated, in the `MCP_CONTAINER_ENV` line that `wra
 
 ```toml
 MCP_CONTAINER_ENV = "MY_SERVER_TOKEN"
+```
+
+Name them under `[secrets]` in the same file as well, so that `wrangler deploy` refuses to deploy while one is not set, and `wrangler dev` passes them on from `.dev.vars`:
+
+```toml
+[secrets]
+required = [
+  "TELEGRAM_BOT_TOKEN",
+  "TELEGRAM_WEBHOOK_SECRET",
+  "LLM_API_KEY",
+  "SESSION_TOKEN_SECRET",
+  "MY_SERVER_TOKEN",
+]
 ```
 
 The MCP container is then started with each of them as an environment variable of the same name, and `mcp-front` passes them on to your server. They are read anew at every start, so a changed secret is in the next container; one that is running keeps the values it was started with until it stops. If one is missing, empty or not text, or is one of the Worker's own secrets, the container is not started at all: requests get a 503 and the log says which variable it was. The agent containers get none of them. A credential that is a file has to become text for this, which is at most 5 KB a secret; your server then writes it back to a file when it starts.

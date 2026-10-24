@@ -20,6 +20,17 @@ enabled = true
 #   LLM_API_KEY              credential for the LLM gateway
 #   SESSION_TOKEN_SECRET     a random string of 16 characters or more; signs the tokens
 #                            containers hold
+# `wrangler deploy` refuses to deploy while one named here is not set, rather than leave
+# the Worker answering 500 to everything. Name the secrets MCP_CONTAINER_ENV lists here
+# too: `wrangler dev` takes from `.dev.vars` only the secrets named here.
+[secrets]
+required = [
+  "TELEGRAM_BOT_TOKEN",
+  "TELEGRAM_WEBHOOK_SECRET",
+  "LLM_API_KEY",
+  "SESSION_TOKEN_SECRET",
+]
+
 [vars]
 # Where agent containers reach this Worker.
 PUBLIC_ORIGIN = "https://agent-worker.example.workers.dev"
