@@ -144,6 +144,7 @@ th:last-child { border-radius: 0 .55rem .55rem 0; }
 .entry:last-child { border-bottom: 0; padding-bottom: 0; }
 .entry p + p, .entry h3 + p, .entry form, .entry details, .entry .actions + p { margin-top: .45rem; }
 .inline-form { display: flex; align-items: flex-end; gap: .65rem; flex-wrap: wrap; }
+.invoice-pages { margin-top: 1rem; }
 details > summary { width: fit-content; cursor: pointer; color: var(--blue-dark); font-weight: 800; }
 details[open] > summary { margin-bottom: .7rem; }
 .cleanup > summary { color: var(--danger); }

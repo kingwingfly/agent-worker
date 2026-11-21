@@ -16,6 +16,7 @@ async function data(response, expected = 200) {
 }
 test('Worker authority boundaries, verified checkout, concurrent claims, and scoped R2 cleanup', async t => {
   let quote, solQuote, finalized = false, feedAge = 0, ethChain = '0x1', solSlot = 42
+  let pauseNextHead
   const mf = new Miniflare(convertV4MiniflareOptions({ workers: [{
     name:'merchant', ...billingModules, compatibilityDate:'2026-10-01',
     routes:['merchant.test/*'], access:{ aud:'local-billing-admin' },
@@ -46,6 +47,9 @@ test('Worker authority boundaries, verified checkout, concurrent claims, and sco
       }
       if (method === 'eth_chainId') return Response.json({result:ethChain})
       if (method === 'eth_getBlockByNumber' && params[0] === 'finalized') {
+        const pause = pauseNextHead
+        pauseNextHead = null
+        if (pause) await pause()
         return Response.json({result:{hash:'head',number:finalized ? '0x11' : '0x09'}})
       }
       const block = {hash:'block',number:'0x10',timestamp:'0x'+Math.floor(quote.created_at/1000).toString(16)}
@@ -125,9 +129,21 @@ test('Worker authority boundaries, verified checkout, concurrent claims, and sco
   assert.equal(quote.tokens,30_000_000)
   assert.equal(quote.product,'tokens')
   assert.equal(quote.expires_at-quote.created_at,900_000)
-  await data(await adminPost('/admin/api/deposits',{...deposit,eth_recipient:''}))
-  const claims = await Promise.all([1,2].map(() => send('/api/claim',{id:quote.id,tx},customer).then(r => data(r,202))))
-  assert.deepEqual(claims.map(r => r.status),['confirming','confirming'])
+  const started = Promise.withResolvers(), resume = Promise.withResolvers()
+  pauseNextHead = () => { started.resolve(); return resume.promise }
+  const reused = send('/api/invoice',{chain:'ETH',usd:'30'},customer)
+  await started.promise
+  try {
+    await data(await adminPost('/admin/api/deposits',{...deposit,eth_recipient:''}))
+    const claims = await Promise.all([1,2].map(() => send('/api/claim',{id:quote.id,tx},customer).then(r => data(r,202))))
+    assert.deepEqual(claims.map(r => r.status),['confirming','confirming'])
+  } finally {
+    resume.resolve()
+  }
+  const refreshed = await data(await reused)
+  assert.equal(refreshed.id,quote.id)
+  assert.equal(refreshed.status,'confirming')
+  assert.equal(refreshed.tx,tx)
   assert.equal((await data(await get('/api/account',customer))).invoices[0].status,'confirming')
   finalized = true
   // No further claims are submitted. The persisted alarm settles after finality on its own.
@@ -152,6 +168,12 @@ test('Worker authority boundaries, verified checkout, concurrent claims, and sco
   assert.equal((await data(await adminGet('/admin/api/overview'))).sales_usd,'40.00')
 
   const paid = await data(await get('/api/account',customer))
+  const older = await data(await get('/api/account?after='+solQuote.id,customer))
+  assert.deepEqual(older.invoices.map(i=>i.id),[quote.id])
+  assert.equal(older.invoices_next,null)
+  const olderForAdmin = await data(await adminGet('/admin/api/users/'+user+'?after='+solQuote.id))
+  assert.deepEqual(olderForAdmin.payments,older.invoices)
+  assert.equal(olderForAdmin.payments_next,null)
   assert.equal(paid.tier,'subscriber')
   assert.equal(paid.allowance_tokens,500_000)
   assert.equal(paid.subscriptions[0].auto_renew,true)

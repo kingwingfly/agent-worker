@@ -42,6 +42,10 @@ test('ETH requires the quoted native wei, reference, mainnet and finalized canon
   for (const change of [{amount:'0.1'},{recipient:'0x'+'00'.repeat(20)},{reference:'0x'},{expires_at:(sec-1)*1000}]) {
     await assert.rejects(verify({...eth,...change},tx,{},ethereum()))
   }
+  const failedReceipt = {transactionHash:tx, blockHash:'block', blockNumber:'0xe9', status:'0x0'}
+  await assert.rejects(verify(eth,tx,{},ethereum({eth_getTransactionReceipt:failedReceipt,final:{number:'0xe8',hash:'head'}})), {status:409})
+  await assert.rejects(verify(eth,tx,{},ethereum({eth_getTransactionReceipt:failedReceipt,canonical:{hash:'reorganized'}})), {status:409})
+  await assert.rejects(verify(eth,tx,{},ethereum({eth_getTransactionReceipt:failedReceipt})), {status:400})
 })
 test('SOL requires a native system transfer, exact memo, real signer, net receipt and mainnet finality', async () => {
   assert.equal(transactionId('SOL',signature),signature)

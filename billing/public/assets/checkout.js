@@ -1,4 +1,4 @@
-import {activeSubscription, api, badge, busy, button, byId, element, empty, money, notice, number, subscription, table, usageExample, usd, when} from "./common.js";
+import {activeSubscription, api, badge, busy, button, byId, element, empty, invoicePager, money, notice, number, subscription, table, usageExample, usd, when} from "./common.js";
 
 const networks = {ETH: "Ethereum", SOL: "Solana"};
 let identityVersion = 0;
@@ -11,6 +11,11 @@ let review;
 let subscribing = false;
 const transfers = new Map();
 const signing = new Set();
+const invoicePages = invoicePager(byId("invoice-pages"), page => {
+  visibleInvoice = null;
+  byId("invoice-detail").hidden = true;
+  return account(page);
+});
 
 // An empty string means the wallet was opened but a transaction ID is not yet known.
 // Keep that state across reloads so returning customers verify their original transfer.
@@ -43,6 +48,7 @@ function signedOut() {
   current = null;
   review = null;
   transfers.clear();
+  invoicePages.show([], null);
   byId("login-screen").hidden = false;
   byId("customer-account").hidden = true;
   byId("logout").hidden = true;
@@ -271,12 +277,14 @@ function displayAccount(data) {
     : empty("Your payment quotes and receipts will appear here after you start a top-up."));
 }
 
-async function account() {
+async function account(page = invoicePages.cursors) {
   const identity = identityVersion, version = ++accountVersion;
-  const data = await customerApi("/api/account");
-  if (identity !== identityVersion || version !== accountVersion) return;
-  displayAccount(data);
   clearTimeout(refreshTimer);
+  const after = page.at(-1);
+  const data = await customerApi("/api/account" + (after ? "?after=" + encodeURIComponent(after) : ""));
+  if (identity !== identityVersion || version !== accountVersion) return;
+  invoicePages.show(page, data.invoices_next);
+  displayAccount(data);
   if (data.invoices.some(i => i.status === "confirming")) {
     refreshTimer = setTimeout(() => account().catch(error => notice(error.message, true)), 15000);
   }
@@ -537,7 +545,7 @@ byId("quote-form").addEventListener("submit", event => {
     const invoice = await customerApi("/api/invoice", {chain, usd: amount});
     if (version !== identityVersion) return;
     showInvoice(invoice);
-    await account();
+    await account([]);
   });
 });
 byId("close-invoice").addEventListener("click", () => {

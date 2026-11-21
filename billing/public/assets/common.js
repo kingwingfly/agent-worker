@@ -80,6 +80,24 @@ export function button(text, onClick, className = "secondary") {
   return node;
 }
 
+// Commit a cursor only after its page loads. Refreshes then keep the operator or customer on that page.
+export function invoicePager(nav, load) {
+  let cursors = [], next = null;
+  const newer = button("Newer invoices", () => load(cursors.slice(0, -1)));
+  const older = button("Older invoices", () => load([...cursors, next]));
+  nav.append(newer, older);
+  return {
+    get cursors() { return cursors; },
+    show(page, following) {
+      cursors = page;
+      next = following;
+      newer.hidden = !page.length;
+      older.hidden = !following;
+      nav.hidden = newer.hidden && older.hidden;
+    }
+  };
+}
+
 export function table(headers, rows) {
   const wrap = element("div", null, "table-wrap");
   const grid = element("table");

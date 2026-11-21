@@ -106,14 +106,14 @@ export async function verify(invoice, tx, env, call = rpc) {
     const [finalized, transfer, receipt] = await Promise.all([
       ethereumHead(ask), ask('eth_getTransactionByHash', [tx]), ask('eth_getTransactionReceipt', [tx])
     ])
-    check(transfer && receipt?.blockNumber, pending, 409)
-    check(receipt.status === '0x1' && receipt.transactionHash?.toLowerCase() === tx && transfer.hash?.toLowerCase() === tx
-      && transfer.blockHash === receipt.blockHash && transfer.to?.toLowerCase() === invoice.recipient.toLowerCase()
-      && transfer.from?.toLowerCase() !== invoice.recipient.toLowerCase()
-      && transfer.input?.toLowerCase() === invoice.reference && BigInt(transfer.value) === units(invoice.amount, 18), mismatch)
+    check(receipt?.blockNumber && receipt.blockHash && transfer?.blockHash === receipt.blockHash, pending, 409)
     check(BigInt(receipt.blockNumber) <= BigInt(finalized.number), pending, 409)
     const block = await ask('eth_getBlockByNumber', [receipt.blockNumber, false])
     check(block?.hash && block.hash === receipt.blockHash, pending, 409)
+    // A receipt can change before finality. Only a canonical, finalized result is definitive.
+    check(receipt.status === '0x1' && receipt.transactionHash?.toLowerCase() === tx && transfer.hash?.toLowerCase() === tx
+      && transfer.to?.toLowerCase() === invoice.recipient.toLowerCase() && transfer.from?.toLowerCase() !== invoice.recipient.toLowerCase()
+      && transfer.input?.toLowerCase() === invoice.reference && BigInt(transfer.value) === units(invoice.amount, 18), mismatch)
     time = Number(BigInt(block.timestamp))
   } else {
     const ask = (method, params = []) => call(env.SOL_RPC_URL, method, params)

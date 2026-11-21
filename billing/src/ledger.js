@@ -252,15 +252,16 @@ export class Ledger {
       }
     }
     const held = call.status === 'released' ? 0 : call.held
+    // Close this hold within the settlement transaction before a due renewal can release stale holds.
+    this.run('UPDATE calls SET status=?,tokens=?,cost_usd=?,charged=?,allocation=? WHERE id=?',
+      failed ? 'failed' : 'settled', tokens, actualCost, charge, '[]', id)
     if (charge <= held) this.refund(call.user, JSON.parse(call.allocation), held - charge)
     else {
       // Counts are estimates. Record the full provider cost while limiting the debit to available funds.
-      const extra = Math.max(0, Math.min(charge - held, this.balance(call.user, now)))
+      const extra = Math.min(charge - held, this.balance(call.user, now))
       this.deduct(call.user, extra, now)
-      charge = held + extra
+      if (held + extra < charge) this.run('UPDATE calls SET charged=? WHERE id=?', held + extra, id)
     }
-    this.run('UPDATE calls SET status=?,tokens=?,cost_usd=?,charged=?,allocation=? WHERE id=?',
-      failed ? 'failed' : 'settled', tokens, actualCost, charge, '[]', id)
     return { ok: true }
   }
   purchaseSettings(user, now) {
@@ -453,14 +454,18 @@ export class Ledger {
       subscriptions: this.subscriptions(id, now, week)
     }
   }
-  payments(id, now) {
-    return this.all(`${orders} WHERE i.user=? ORDER BY i.created_at DESC,i.id DESC LIMIT 50`, id).map(row => this.showOrder(row, now))
+  payments(id, now, after) {
+    const cursor = after ? this.order(after, id) : null
+    const rows = this.all(`${orders} WHERE i.user=? AND (i.created_at,i.id)<(?,?)
+      ORDER BY i.created_at DESC,i.id DESC LIMIT 51`, id, cursor?.created_at ?? Number.MAX_SAFE_INTEGER, cursor?.id ?? '')
+    return { invoices: rows.slice(0,50).map(row => this.showOrder(row, now)), invoices_next: rows.length > 50 ? rows[49].id : null }
   }
-  detail(id, now) {
+  detail(id, now, after) {
+    const page = this.payments(id, now, after)
     return {
       ...this.account(id, now),
       ...this.one('SELECT coalesce(sum(tokens),0) AS billable_tokens,coalesce(sum(cost_usd),0) AS cost_usd FROM calls WHERE user=?', id),
-      payments: this.payments(id, now),
+      payments: page.invoices, payments_next: page.invoices_next,
       adjustments: this.all('SELECT action,reason,tokens,created_at FROM adjustments WHERE user=? ORDER BY created_at DESC LIMIT 50', id)
     }
   }

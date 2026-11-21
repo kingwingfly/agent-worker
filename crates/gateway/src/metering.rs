@@ -33,13 +33,14 @@ fn merge(total: &mut Usage, reported: &Value) {
 
 /// Collects usage from a server-sent event stream, fed in whatever pieces it arrives in.
 ///
-/// `message_start` reports the input side and `message_delta` the output so far; only
-/// those two are parsed, not the many content deltas in between.
+/// `message_start` reports the input usage and `message_delta` the output so far.
+/// An error can end the stream before either arrives.
 #[derive(Debug, Default)]
 pub struct SseUsage {
     line: Vec<u8>,
     overlong: bool,
     usage: Usage,
+    failed: bool,
 }
 
 impl SseUsage {
@@ -61,10 +62,17 @@ impl SseUsage {
     }
 
     fn read_line(&mut self) {
+        if let Some(name) = self.line.strip_prefix(b"event:") {
+            self.failed |= name.trim_ascii() == b"error";
+            return;
+        }
         let Some(data) = self.line.strip_prefix(b"data:") else {
             return;
         };
-        if !data.windows(7).any(|window| window == b"\"usage\"") {
+        if !data
+            .windows(7)
+            .any(|word| matches!(word, b"\"usage\"" | b"\"error\""))
+        {
             return;
         }
         let Ok(event) = serde_json::from_slice::<Value>(data) else {
@@ -73,12 +81,22 @@ impl SseUsage {
         match event["type"].as_str() {
             Some("message_start") => merge(&mut self.usage, &event["message"]["usage"]),
             Some("message_delta") => merge(&mut self.usage, &event["usage"]),
+            Some("error") => self.failed = true,
             _ => {}
         }
     }
 
     pub fn usage(&self) -> Usage {
         self.usage
+    }
+
+    /// An explicit failure without usage releases the hold. A stream with missing usage
+    /// stays eligible for a late report, and a partial stream keeps the usage it reported.
+    pub fn finish(mut self) -> Option<Usage> {
+        if !self.overlong && !self.line.is_empty() {
+            self.read_line();
+        }
+        (!self.failed || self.usage != Usage::default()).then_some(self.usage())
     }
 }
 
@@ -145,6 +163,23 @@ mod tests {
         scanner.feed(&STREAM.as_bytes()[..cut]);
         assert_eq!(scanner.usage().input_tokens, 25);
         assert_eq!(scanner.usage().output_tokens, 1);
+    }
+
+    #[test]
+    fn streaming_errors_preserve_reported_usage_and_release_an_unused_hold() {
+        for error in [
+            b"event: error\r\n\r\n".as_slice(),
+            br#"data: {"type":"error","error":{"type":"overloaded_error"}}"#,
+        ] {
+            let mut empty = SseUsage::default();
+            empty.feed(error);
+            assert_eq!(empty.finish(), None);
+            let mut partial = SseUsage::default();
+            partial.feed(STREAM.as_bytes());
+            partial.feed(error);
+            assert_eq!(partial.finish(), Some(expected()));
+        }
+        assert_eq!(SseUsage::default().finish(), Some(Usage::default()));
     }
 
     #[test]

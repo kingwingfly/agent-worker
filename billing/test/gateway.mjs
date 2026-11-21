@@ -61,15 +61,17 @@ test('compiled gateway enforces cross-chat quota, pays out Stars receipts and pr
         return Response.json({ok:true,result:{message_id:sent.length}})
       }
       assert.equal(url.hostname,'model.test')
-      models.push({path:url.pathname,body})
+      models.push({path:url.pathname,query:url.search,body})
       if(url.pathname.endsWith('/count_tokens')) return Response.json({input_tokens:4})
+      if(body.stream) return new Response('event: error\ndata: {"type":"error","error":{"type":"overloaded_error"}}\n\n',
+        {headers:{'content-type':'text/event-stream'}})
       return Response.json({type:'message',content:[],usage:{input_tokens:4,output_tokens:6}})
     }}
   }]}))
   t.after(()=>mf.dispose())
   const paid=await mf.getWorker('paid'), free=await mf.getWorker('free')
   const webhook=(target,update)=>target.fetch('https://agent.test/tg/webhook',post(update,{'x-telegram-bot-api-secret-token':'test-webhook'}))
-  const ask=(target)=>target.fetch('https://agent.test/llm/v1/messages',post({model:'large',messages:[{role:'user',content:'hi'}],max_tokens:50},
+  const ask=(target,options={})=>target.fetch('https://agent.test/llm/v1/messages?beta=true',post({model:'large',messages:[{role:'user',content:'hi'}],max_tokens:50,...options},
     {authorization:'Bearer '+token('tg:'+group)}))
   const config=await (await mf.dispatchFetch('https://bill.test/admin/api/settings')).json()
   const change=await mf.dispatchFetch('https://bill.test/admin/api/settings',post({...config,free_weekly_tokens:16}))
@@ -80,9 +82,22 @@ test('compiled gateway enforces cross-chat quota, pays out Stars receipts and pr
   await webhook(paid,message('/account',group))
   assert.match(sent.at(-1).body.text,/private chat/)
   await webhook(paid,message('hello',group))
-  const answer=await ask(paid)
+  const readAccount=async ()=>(await mf.dispatchFetch('https://bill.test/admin/api/users/'+person)).json()
+  const earlyError=await ask(paid,{stream:true})
+  assert.match(await earlyError.text(),/event: error/)
+  for(let i=0;i<30 && (await readAccount()).available_tokens!==16;i++) {
+    await new Promise(resolve=>setTimeout(resolve,20))
+  }
+  assert.equal((await readAccount()).available_tokens,16,'a failed stream must release the reservation')
+  const beforeAnswer=models.length
+  const context={edits:[{type:'clear_tool_uses_20250919'}]}
+  const answer=await ask(paid,{context_management:context})
   assert.equal(answer.status,200,await answer.text())
-  assert.deepEqual(models.map(m=>m.path),['/v1/messages/count_tokens','/v1/messages'])
+  assert.deepEqual(models.slice(beforeAnswer).map(m=>m.path),['/v1/messages/count_tokens','/v1/messages'])
+  for(const request of models.slice(beforeAnswer)) {
+    assert.equal(request.query,'?beta=true')
+    assert.deepEqual(request.body.context_management,context)
+  }
   assert.equal(models.at(-1).body.max_tokens,6)
   for(let i=0;i<25;i++){
     const detail=await (await mf.dispatchFetch('https://bill.test/admin/api/users/'+person)).json()
@@ -102,7 +117,6 @@ test('compiled gateway enforces cross-chat quota, pays out Stars receipts and pr
   assert.equal(sent.at(-1).body.ok,true)
   const receipt={message:{...message('').message,successful_payment:{...purchase,telegram_payment_charge_id:'test-stars-charge'}}}
   for(let i=0;i<2;i++) assert.equal((await webhook(paid,receipt)).status,200)
-  const readAccount=async ()=>(await mf.dispatchFetch('https://bill.test/admin/api/users/'+person)).json()
   assert.equal((await readAccount()).wallet_tokens,3_250_000)
   await webhook(paid,message('/subscribe'))
   const confirmation=sent.at(-1).body.text.match(/\/subscribe [a-f0-9-]{36}/)[0]

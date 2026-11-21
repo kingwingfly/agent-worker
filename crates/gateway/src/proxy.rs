@@ -285,7 +285,8 @@ async fn forward(
         LlmAuth::ApiKey => headers.set("x-api-key", &cfg.llm_api_key)?,
     }
     let reservation = if let Some(user) = payer {
-        match billing::model::prepare(env, cfg, user, path, &headers, &mut body).await? {
+        let count_target = format!("{}/v1/messages/count_tokens{query}", cfg.llm_base_url);
+        match billing::model::prepare(env, user, path, &count_target, &headers, &mut body).await? {
             billing::model::Admission::Ready(reservation) => reservation,
             billing::model::Admission::Refused(response) => return Ok(response),
         }
@@ -363,28 +364,22 @@ async fn meter(
         .headers()
         .get("content-type")?
         .is_some_and(|kind| kind.starts_with("text/event-stream"));
-    let usage: Usage = if streamed {
+    let usage = if streamed {
         let mut scanner = SseUsage::default();
         let mut body = copy.stream()?;
         // A stream that breaks off still counts for what it had reported by then.
         while let Some(Ok(chunk)) = body.next().await {
             scanner.feed(&chunk);
         }
-        scanner.usage()
+        scanner.finish()
     } else {
         let body = copy.bytes().await?;
-        if reservation.is_some() && !scrub::is_answer(&body) {
-            if let Some(hold) = reservation {
-                hold.finish(None).await;
-            }
-            return Ok(());
-        }
-        json_usage(&body)
+        (reservation.is_none() || scrub::is_answer(&body)).then(|| json_usage(&body))
     };
     if let Some(hold) = reservation {
-        hold.finish(Some(usage)).await;
+        hold.finish(usage).await;
     }
-    let tokens = usage.billable();
+    let tokens = usage.as_ref().map_or(0, Usage::billable);
     if tokens == 0 {
         return Ok(());
     }

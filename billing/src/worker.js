@@ -147,14 +147,15 @@ export class BillingLedger extends DurableObject {
       const user = auth.user
       if (get && path === '/api/account') {
         const detail = this.atomic(() => book.account(user, now))
-        return json({ ...detail, ...this.catalog(), invoices: book.payments(user, now) })
+        return json({ ...detail, ...this.catalog(), ...book.payments(user, now, url.searchParams.get('after')) })
       }
       if (post && path === '/api/invoice') {
         check(['ETH','SOL'].includes(body.chain), 'Choose ETH or SOL.')
         const issue = (at, rate) => this.atomic(() => book.invoice(user, body.chain, this.env, at, body.usd, rate))
         const existing = issue(now, null)
         const [rate] = await Promise.all([existing ? null : spotRate(body.chain), checkPaymentNetwork(body.chain, this.env)])
-        const order = existing ?? issue(Date.now(), rate)
+        // Another checkout can submit or settle this invoice while the RPC is responding.
+        const order = existing ? book.order(existing.id, user) : issue(Date.now(), rate)
         return json(book.showOrder(order, Date.now()))
       }
       if (post && path === '/api/subscribe') {
@@ -309,7 +310,7 @@ export class BillingLedger extends DurableObject {
     check(match, 'Not found.', 404)
     const user = userId(match[1]), action = match[2]
     book.user(user)
-    if (get && !action) return json(this.atomic(() => book.detail(user, now)))
+    if (get && !action) return json(this.atomic(() => book.detail(user, now, query.get('after'))))
     if (post && action === 'adjust') return json(this.atomic(() => book.adjust(user, body, now)))
     if (get && action === 'history') {
       const before = integer(Number(query.get('before') || Number.MAX_SAFE_INTEGER), 1, Number.MAX_SAFE_INTEGER, 'history cursor')

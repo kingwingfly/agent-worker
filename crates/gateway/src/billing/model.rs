@@ -7,7 +7,6 @@ use worker::{Delay, Env, Fetch, Headers, Method, Response, Result, console_error
 
 use super::post;
 use crate::{
-    config::Config,
     platform::{error, expect_ok, random_uuid},
     proxy::{failure, kept_headers, rebuilt, refused},
 };
@@ -80,6 +79,10 @@ fn count_body(message: &Value) -> Value {
         "thinking",
         "output_config",
         "cache_control",
+        "billing_policy",
+        "compaction",
+        "context_management",
+        "mcp_servers",
         "speed",
         "user_profile_id",
         "workspace_id",
@@ -93,9 +96,9 @@ fn count_body(message: &Value) -> Value {
 
 pub async fn prepare(
     env: &Env,
-    cfg: &Config,
     user: &str,
     path: &str,
+    count_target: &str,
     headers: &Headers,
     body: &mut Vec<u8>,
 ) -> Result<Admission> {
@@ -126,10 +129,9 @@ pub async fn prepare(
                 "A positive max_tokens limit is required.",
             )?));
         };
-        let target = format!("{}/v1/messages/count_tokens", cfg.llm_base_url);
         let request = rebuilt(
             Method::Post,
-            &target,
+            count_target,
             headers.clone(),
             &serde_json::to_vec(&count_body(&message))?,
         )?;

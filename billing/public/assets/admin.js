@@ -1,4 +1,4 @@
-import {activeSubscription, api, badge, busy, button, byId, element, empty, money, notice, number, subscription, table, usageExample, usd, when} from "./common.js";
+import {activeSubscription, api, badge, busy, button, byId, element, empty, invoicePager, money, notice, number, subscription, table, usageExample, usd, when} from "./common.js";
 
 const base = "/admin/api";
 const views = ["overview", "users", "settings", "deposits", "account"];
@@ -13,6 +13,7 @@ let account;
 let historyBefore = null;
 let historyAfterId = null;
 const adjustments = new Map();
+const paymentPages = invoicePager(byId("payment-pages"), page => loadAccount(currentUser, page));
 
 function userPath(id, part = "") {
   return `${base}/users/${encodeURIComponent(id)}${part}`;
@@ -154,10 +155,12 @@ function revokeForm(row) {
   return disclosure;
 }
 
-async function loadAccount(id) {
+async function loadAccount(id, page = paymentPages.cursors) {
   const version = ++accountVersion;
-  const data = await api(userPath(id));
+  const after = page.at(-1);
+  const data = await api(userPath(id) + (after ? "?after=" + encodeURIComponent(after) : ""));
   if (currentUser !== id || version !== accountVersion) return;
+  paymentPages.show(page, data.payments_next);
   account = data;
   byId("account-title").textContent = "User " + data.id;
   byId("account-state").replaceChildren(data.blocked ? badge("Blocked", "alert") : badge("Enabled", "good"));
@@ -399,6 +402,7 @@ async function navigate() {
       if (version === viewVersion) showDeposits(data);
     }
     if (selected === "account") {
+      paymentPages.show([], null);
       byId("account-title").textContent = "User " + id;
       byId("account-body").hidden = true;
       byId("account-state").replaceChildren();
