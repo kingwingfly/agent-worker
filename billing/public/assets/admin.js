@@ -6,6 +6,7 @@ let currentUser = "";
 let viewVersion = 0;
 let userSearchVersion = 0;
 let accountVersion = 0;
+let applicationVersion = 0, applicationOffset = 0;
 let historyVersion = 0;
 let userRows = [];
 let search = "";
@@ -14,6 +15,7 @@ let historyBefore = null;
 let historyAfterId = null;
 const adjustments = new Map();
 const paymentPages = invoicePager(byId("payment-pages"), page => loadAccount(currentUser, page));
+const approvalLabel = {none: "Not on whitelist", pending: "Pending review", approved: "Whitelisted", declined: "Declined", revoked: "Revoked"};
 
 function userPath(id, part = "") {
   return `${base}/users/${encodeURIComponent(id)}${part}`;
@@ -43,14 +45,14 @@ async function listUsers(more = false) {
     byId("user-list").replaceChildren(empty("Loading users…"));
     byId("more-users").hidden = true;
   }
-  const params = new URLSearchParams({q: search, offset: userRows.length});
+  const params = new URLSearchParams({q: search, offset: userRows.length, approval: byId("user-search").elements.approval.value});
   const {users, more: hasMore} = await api(base + "/users?" + params);
   if (request !== userSearchVersion || byId("users").hidden) return;
   userRows.push(...users);
   const rows = userRows.map(user => {
     const link = element("a", user.id, "mono");
     link.href = "#account/" + encodeURIComponent(user.id);
-    return [link, user.blocked ? badge("Blocked", "alert") : badge("Enabled", "good"), number(user.wallet_tokens), when(user.created_at)];
+    return [link, user.blocked ? badge("Suspended", "alert") : badge(approvalLabel[user.approval_status], user.approval_status === "approved" ? "good" : ""), number(user.wallet_tokens), when(user.created_at)];
   });
   byId("user-list").replaceChildren(rows.length
     ? table(["Telegram ID", "Access", "Wallet tokens", "Joined"], rows)
@@ -58,20 +60,57 @@ async function listUsers(more = false) {
   byId("more-users").hidden = !hasMore;
 }
 
+async function listApplications(offset = 0) {
+  const version = ++applicationVersion;
+  const {applications, more} = await api(base + "/applications?offset=" + offset);
+  if (version !== applicationVersion || byId("users").hidden) return;
+  if (!applications.length && offset) return listApplications(0);
+  applicationOffset = offset;
+  const rows = applications.map(row => {
+    const applicant = element("a", [row.name, row.username && "@" + row.username].filter(Boolean).join(" · ") || row.user);
+    applicant.href = "#account/" + row.user;
+    const identity = element("div");
+    identity.append(applicant);
+    if (row.name || row.username) identity.append(element("p", "Telegram ID " + row.user, "muted mono"));
+    const actions = element("div", null, "actions");
+    for (const [label, status] of [["Approve","approved"],["Decline","declined"]]) {
+      actions.append(button(label, async () => {
+        await api(userPath(row.user, "/access"), {status, expected:"pending"});
+        await Promise.all([listApplications(applicationOffset), listUsers()]);
+      }));
+    }
+    return [identity, row.note || "—", when(row.applied_at), actions];
+  });
+  byId("applications").replaceChildren(rows.length ? table(["Applicant", "Note", "Applied", "Decision"], rows)
+    : empty("No applications are waiting for review."));
+  byId("prev-applications").hidden = !offset;
+  byId("next-applications").hidden = !more;
+}
+byId("refresh-applications").addEventListener("click", e => busy(e.currentTarget, () => listApplications(applicationOffset)));
+byId("prev-applications").addEventListener("click", e => busy(e.currentTarget, () => listApplications(Math.max(0, applicationOffset-50))));
+byId("next-applications").addEventListener("click", e => busy(e.currentTarget, () => listApplications(applicationOffset+50)));
+
 const plan = byId("plan");
-const settingFields = [...plan.querySelectorAll("input[name]")];
+const settingFields = [...plan.querySelectorAll("[name]")];
+const modeText = {
+  paid: "Paid access is open to whitelisted accounts. Chat uses the weekly allowance, then the wallet.",
+  free: "Free access is open to whitelisted accounts. New purchases are paused.",
+  closed: "Access is closed. In Plan settings, select paid or free access and save to open chat."
+};
 async function settings(version) {
   const data = await api(base + "/settings");
   if (version !== viewVersion) return;
-  for (const input of settingFields) {
-    if (input.type === "checkbox") input.checked = Boolean(data[input.name]);
-    else input.value = data[input.name] ?? "";
-  }
-  displayPlanPrice(data);
+  showSettings(data);
   byId("plan-fields").disabled = false;
 }
 
-function displayPlanPrice(data) {
+function showSettings(data) {
+  for (const input of settingFields) {
+    if (input.type === "checkbox") input.checked = Boolean(data[input.name]);
+    else input.value = data[input.name] ?? "";
+    input.dataset.saved = input.type === "checkbox" ? String(input.checked) : input.value;
+  }
+  byId("plan-mode").textContent = modeText[data.mode];
   byId("saved-example").textContent = usageExample(data);
   byId("saved-price").textContent = data.free_weekly_tokens > 0
     ? `The saved subscriber allowance is ${number(data.paid_weekly_tokens)} tokens per week (5× free). Renewal costs ${number(data.plan_price_tokens)} wallet tokens per month (${usd(data.monthly_usd)}).`
@@ -80,16 +119,25 @@ function displayPlanPrice(data) {
 
 function showDeposits(data) {
   const form = byId("deposit-form");
+  byId("deposit-mode").textContent = modeText[data.mode];
   for (const chain of ["ETH", "SOL"]) {
     const prefix = chain.toLowerCase();
     const field = form.elements[prefix + "_recipient"];
-    field.value = data[field.name] || "";
+    field.defaultValue = field.value = data[field.name];
+    delete field.dataset.inherit;
+    field.oninput = () => { delete field.dataset.inherit; };
     const network = data.networks[chain];
-    byId(prefix + "-status").replaceChildren(network.ready ? badge("Configured", "good") : badge("Setup needed", "alert"));
+    byId(prefix + "-status").replaceChildren(network.ready ? badge("Configured", "good") : badge("Off"));
     const details = byId(prefix + "-setup");
     details.replaceChildren();
-    if (!field.value) details.append(element("p", "Enter a receiving address for this network.", "hint"));
-    else if (network.rpc_configured && !network.ready) details.append(element("p", "Enter a valid receiving address for this network.", "hint"));
+    if (network.overridden) {
+      details.append(element("p", "Saved in the dashboard.", "hint"), button("Use Wrangler default", () => {
+        field.value = network.default_address;
+        field.dataset.inherit = "true";
+        notice("Save deposit addresses to use the Wrangler default for " + chain + ".");
+      }));
+    } else if (field.value) details.append(element("p", "Using the Wrangler default.", "hint"));
+    if (field.value && network.rpc_configured && !network.ready) details.append(element("p", "Enter a valid receiving address for this network.", "hint"));
     if (!network.rpc_configured) {
       const name = chain + "_RPC_URL";
       details.append(element("p", "Configure the mainnet RPC endpoint as a billing Worker secret.", "hint"),
@@ -107,7 +155,11 @@ byId("deposit-form").addEventListener("submit", event => {
   event.preventDefault();
   const form = event.currentTarget;
   const version = viewVersion;
-  const payload = {eth_recipient: form.elements.eth_recipient.value.trim(), sol_recipient: form.elements.sol_recipient.value.trim()};
+  const payload = {};
+  for (const field of form.querySelectorAll("input[name]")) {
+    if (field.dataset.inherit) payload[field.name] = null;
+    else if (field.value.trim() !== field.defaultValue) payload[field.name] = field.value.trim();
+  }
   busy(event.submitter, async () => {
     const saved = await api(base + "/deposits", payload);
     if (version !== viewVersion) return;
@@ -120,6 +172,8 @@ plan.addEventListener("submit", event => {
   event.preventDefault();
   const payload = {};
   for (const input of settingFields) {
+    if ((input.type === "checkbox" ? String(input.checked) : input.value) === input.dataset.saved) continue;
+    if (input.name === "access_mode") payload.expected_access_mode = input.dataset.saved;
     if (input.type === "checkbox") payload[input.name] = input.checked;
     else if (input.name === "monthly_usd") payload[input.name] = input.valueAsNumber.toFixed(2);
     else if (["input_usd", "output_usd"].includes(input.name)) payload[input.name] = input.valueAsNumber.toFixed(6);
@@ -130,7 +184,7 @@ plan.addEventListener("submit", event => {
   busy(event.submitter, async () => {
     const saved = await api(base + "/settings", payload);
     if (version === viewVersion) {
-      displayPlanPrice(saved);
+      showSettings(saved);
       notice("Plan settings saved.");
     }
   });
@@ -163,17 +217,20 @@ async function loadAccount(id, page = paymentPages.cursors) {
   paymentPages.show(page, data.payments_next);
   account = data;
   byId("account-title").textContent = "User " + data.id;
-  byId("account-state").replaceChildren(data.blocked ? badge("Blocked", "alert") : badge("Enabled", "good"));
-  byId("available").textContent = number(data.available_tokens);
+  byId("account-state").replaceChildren(data.blocked ? badge("Suspended", "alert") : badge(approvalLabel[data.approval_status], data.approval_status === "approved" ? "good" : ""));
+  const metered = data.access_mode === "paid", closed = data.access_mode === "closed";
+  byId("available").textContent = data.blocked ? "Blocked" : closed ? "Closed" : data.approval_status !== "approved" ? "Approval required" : metered ? number(data.available_tokens) : "Unlimited";
   byId("wallet-tokens").textContent = number(data.wallet_tokens);
-  byId("weekly-left").textContent = number(data.remaining_weekly_tokens);
+  byId("weekly-left").textContent = closed ? "Paused" : metered ? number(data.remaining_weekly_tokens) : "Unlimited";
   const tier = data.tier === "subscriber" ? "Subscriber" : "Free";
   const next = data.next_refill ? " · Next refill " + when(data.next_refill) : "";
-  byId("user-allowance").textContent = `${tier} · ${number(data.allowance_tokens)} tokens per week${next}`;
+  byId("user-allowance").textContent = closed ? modeText.closed : metered ? `${tier} · ${number(data.allowance_tokens)} tokens per week${next}` : "Free chat. Wallet tokens are saved.";
   byId("account-tokens").textContent = number(data.billable_tokens);
   byId("account-cost").textContent = money(data.cost_usd);
   byId("joined").textContent = "Joined " + when(data.created_at);
   byId("toggle-user").textContent = data.blocked ? "Restore access" : "Block access";
+  byId("whitelist-status").textContent = approvalLabel[data.approval_status];
+  byId("toggle-whitelist").textContent = data.approval_status === "approved" ? "Remove from whitelist" : "Add to whitelist";
   const subs = data.subscriptions.map(row => {
     const item = subscription(row);
     item.append(element("p", `${row.source} · ${row.id}`, "muted mono"));
@@ -224,6 +281,13 @@ for (const action of ["airdrop", "grant"]) {
 byId("toggle-user").addEventListener("click", event => {
   const blocked = !account.blocked;
   busy(event.currentTarget, () => adjust({action: "block", blocked, reason: blocked ? "Blocked access" : "Restored access"}, blocked ? "User access blocked." : "User access restored."));
+});
+byId("toggle-whitelist").addEventListener("click", event => {
+  const id = currentUser, expected = account.approval_status;
+  busy(event.currentTarget, async () => {
+    await api(userPath(id, "/access"), {status: expected === "approved" ? "revoked" : "approved", expected});
+    if (currentUser === id) await loadAccount(id);
+  });
 });
 
 function fileUrl(path, id) {
@@ -391,7 +455,7 @@ async function navigate() {
   notice();
   try {
     if (selected === "overview") await overview(version);
-    if (selected === "users") await listUsers();
+    if (selected === "users") await Promise.all([listUsers(), listApplications()]);
     if (selected === "settings") {
       byId("plan-fields").disabled = true;
       await settings(version);
@@ -430,12 +494,13 @@ byId("add-user").addEventListener("submit", event => {
   const form = event.currentTarget;
   const version = viewVersion;
   busy(event.submitter, async () => {
-    const user = await api(base + "/users", {id: form.elements.id.value.trim()});
+    const user = await api(base + "/users", {id: form.elements.id.value.trim(), approve: form.elements.approve.checked});
     form.reset();
     if (version === viewVersion) location.hash = "#account/" + encodeURIComponent(user.id);
   });
 });
 byId("more-users").addEventListener("click", event => busy(event.currentTarget, () => listUsers(true)));
+byId("user-filter").addEventListener("change", () => listUsers().catch(err => notice(err.message, true)));
 byId("user-search").addEventListener("submit", event => {
   event.preventDefault();
   search = event.currentTarget.elements.q.value.trim();

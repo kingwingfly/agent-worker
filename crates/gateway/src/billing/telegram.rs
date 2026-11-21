@@ -68,10 +68,24 @@ pub async fn payment_update(env: &Env, cfg: &Config, body: &str) -> Result<bool>
 }
 
 /// Only private messages can issue browser sign-in codes or invoices. A guest's
-/// refusal uses its one reply. Buttons and control commands keep their normal route.
+/// refusal uses its one reply. Controls require approval without consuming chat quota.
 pub async fn intercept(env: &Env, cfg: &Config, update: &Update, origin: &Origin) -> Result<bool> {
     let Some(message) = update.message.as_ref().or(update.guest_message.as_ref()) else {
-        return Ok(false);
+        let mut response =
+            post(env, "welcome", json!({"user": origin.user_id.to_string()})).await?;
+        if response.status_code() == 200 {
+            return Ok(false);
+        }
+        if let Some(query) = &update.callback_query {
+            let reason = response.json::<Value>().await.unwrap_or_default();
+            Bot::new(cfg)
+                .answer_callback(
+                    &query.id,
+                    Some(reason["error"].as_str().unwrap_or(UNAVAILABLE)),
+                )
+                .await?;
+        }
+        return Ok(true);
     };
     let guest = update.guest_message.is_some();
     let text = message.text.as_deref().unwrap_or_default().trim();
@@ -84,12 +98,13 @@ pub async fn intercept(env: &Env, cfg: &Config, update: &Update, origin: &Origin
     let action = match words.next().and_then(|s| s.split('@').next()) {
         Some("/start") => "welcome",
         Some("/account") => "account",
+        Some("/apply") => "apply",
         Some("/topup" | "/pay") => "topup",
         Some("/subscribe") => "subscribe",
         Some("/unsubscribe") => "unsubscribe",
         Some("/paysupport") => "support",
-        Some(word) if word.starts_with('/') => return Ok(false),
-        _ if text.is_empty() && !(guest && message.replied().is_some()) => return Ok(false),
+        Some(word) if word.starts_with('/') => "welcome",
+        _ if text.is_empty() && !(guest && message.replied().is_some()) => "welcome",
         _ => "access",
     };
     let bot = Bot::new(cfg);
@@ -98,7 +113,14 @@ pub async fn intercept(env: &Env, cfg: &Config, update: &Update, origin: &Origin
         "Send this command in a private chat with me.".to_owned()
     } else {
         let mut payload = json!({ "user": origin.user_id.to_string() });
-        if let Some(argument) = words.next() {
+        if matches!(action, "account" | "apply")
+            && let Some(sender) = &message.from
+        {
+            payload["profile"] = json!({"name": sender.first_name, "username": sender.username});
+        }
+        if action == "apply" {
+            payload["note"] = words.collect::<Vec<_>>().join(" ").into();
+        } else if let Some(argument) = words.next() {
             match action {
                 "subscribe" => payload["quote"] = argument.into(),
                 "topup" => payload["usd"] = argument.into(),
@@ -132,6 +154,9 @@ pub async fn intercept(env: &Env, cfg: &Config, update: &Update, origin: &Origin
                 value["text"].as_str().unwrap_or(UNAVAILABLE).to_owned()
             }
             Ok(mut response) => {
+                if response.status_code() == 403 && !private && !guest {
+                    return Ok(true);
+                }
                 let problem = response.json::<Value>().await.unwrap_or_default();
                 problem["error"].as_str().unwrap_or(UNAVAILABLE).to_owned()
             }

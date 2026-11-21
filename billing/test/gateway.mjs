@@ -17,7 +17,7 @@ function token(session) {
 }
 
 test('compiled gateway enforces cross-chat quota, pays out Stars receipts and preserves unbilled deployments',async t=>{
-  const sent=[], models=[]
+  const sent=[], models=[], tools=[]
   const gateway = enabled => ({
     name:enabled?'paid':'free', compatibilityDate:'2026-10-01', modulesRoot:build,
     modules:[{type:'ESModule',path:build+'index.js'},{type:'CompiledWasm',path:build+'index_bg.wasm'}],
@@ -54,6 +54,10 @@ test('compiled gateway enforces cross-chat quota, pays out Stars receipts and pr
     }}`,
     serviceBindings:{FIXTURE:async req=>{
       const url=new URL(req.url)
+      if(url.hostname==='mcp.test') {
+        tools.push(url.pathname)
+        return Response.json({ok:true})
+      }
       if(url.hostname==='tg.test'&&url.pathname.endsWith('/sendDocument')) return Response.json({ok:true,result:{message_id:50}})
       const body=await req.json()
       if(url.hostname==='tg.test'){
@@ -73,15 +77,39 @@ test('compiled gateway enforces cross-chat quota, pays out Stars receipts and pr
   const webhook=(target,update)=>target.fetch('https://agent.test/tg/webhook',post(update,{'x-telegram-bot-api-secret-token':'test-webhook'}))
   const ask=(target,options={})=>target.fetch('https://agent.test/llm/v1/messages?beta=true',post({model:'large',messages:[{role:'user',content:'hi'}],max_tokens:50,...options},
     {authorization:'Bearer '+token('tg:'+group)}))
+  const tool=path=>paid.fetch('https://agent.test'+path,{headers:{authorization:'Bearer '+token('tg:'+group)}})
   const config=await (await mf.dispatchFetch('https://bill.test/admin/api/settings')).json()
-  const change=await mf.dispatchFetch('https://bill.test/admin/api/settings',post({...config,free_weekly_tokens:16}))
+  assert.equal(config.mode,'closed')
+  await webhook(paid,message('/account'))
+  assert.match(sent.at(-1).body.text,/access is closed/)
+  await webhook(paid,message('/topup 1'))
+  assert.equal(sent.at(-1).method,'sendMessage')
+  assert.match(sent.at(-1).body.text,/access is closed/)
+  const application=message('/apply Please approve my research account')
+  application.message.from.first_name='Ada'
+  application.message.from.username='ada_test'
+  await webhook(paid,application)
+  assert.match(sent.at(-1).body.text,/waiting for admin review/)
+  const queue=await (await mf.dispatchFetch('https://bill.test/admin/api/applications')).json()
+  assert.deepEqual([queue.applications[0].user,queue.applications[0].username,queue.applications[0].note],[String(person),'ada_test','Please approve my research account'])
+  const change=await mf.dispatchFetch('https://bill.test/admin/api/settings',post({access_mode:'paid',allow_stars_only:true,free_weekly_tokens:16}))
   assert.equal(change.status,200)
+  const beforeGroup=sent.length
+  await webhook(paid,message('hello',group))
+  assert.equal(sent.length,beforeGroup)
+  await webhook(paid,message('/new'))
+  assert.match(sent.at(-1).body.text,/waiting for admin review/)
+  await webhook(paid,{callback_query:{id:'cb',from:{id:person},message:message('').message,data:'resume'}})
+  assert.equal(sent.at(-1).method,'answerCallbackQuery')
+  assert.match(sent.at(-1).body.text,/waiting for admin review/)
+  await mf.dispatchFetch('https://bill.test/admin/api/users/'+person+'/access',post({status:'approved',expected:'pending'}))
   assert.equal((await ask(paid)).status,403)
   assert.equal((await webhook(paid,message('/account'))).status,200)
   assert.match(sent.at(-1).body.text,/Available tokens: 16/)
   await webhook(paid,message('/account',group))
   assert.match(sent.at(-1).body.text,/private chat/)
   await webhook(paid,message('hello',group))
+  assert.equal((await tool('/mcp')).status,200)
   const readAccount=async ()=>(await mf.dispatchFetch('https://bill.test/admin/api/users/'+person)).json()
   const earlyError=await ask(paid,{stream:true})
   assert.match(await earlyError.text(),/event: error/)
@@ -146,6 +174,27 @@ test('compiled gateway enforces cross-chat quota, pays out Stars receipts and pr
   assert.equal(files.files[0].name,'report.txt')
   assert.deepEqual(await (await admin(files.files[0].preview_url)).json(),{text:'test report',truncated:false})
   assert.equal(await (await admin(files.files[0].url)).text(),'test report')
+
+  await mf.dispatchFetch('https://bill.test/admin/api/settings',post({allow_stars_only:false}))
+  const startingWallet=(await readAccount()).wallet_tokens
+  const unconfigured=models.length
+  assert.equal((await ask(paid)).status,403)
+  assert.equal(models.length,unconfigured)
+  assert.equal((await tool('/file')).status,403)
+  const freeAccess=await mf.dispatchFetch('https://bill.test/admin/api/settings',post({access_mode:'free'}))
+  assert.equal(freeAccess.status,200)
+  assert.equal((await ask(paid)).status,200)
+  assert.equal(models.length,unconfigured+1)
+  assert.equal(models.at(-1).body.max_tokens,50)
+  const unlimited=await readAccount()
+  assert.equal(unlimited.available_tokens,null)
+  assert.equal(unlimited.wallet_tokens,startingWallet)
+  assert.equal((await tool('/file')).status,200)
+  await mf.dispatchFetch('https://bill.test/admin/api/users/'+person+'/access',post({status:'revoked'}))
+  assert.equal((await ask(paid)).status,403)
+  assert.equal(models.length,unconfigured+1)
+  assert.equal((await tool('/mcp')).status,403)
+  assert.deepEqual(tools,['/mcp','/file'])
 
   // With no billing binding, the original proxy never issues a pre-count or reduces max_tokens.
   const before=models.length

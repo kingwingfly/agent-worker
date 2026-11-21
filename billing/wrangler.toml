@@ -18,11 +18,13 @@ type = "Data"
 globs = ["**/public/assets/*.webp", "**/public/assets/*.woff2"]
 fallthrough = true
 
-# Set receiving addresses in the dashboard. These optional deployment defaults apply
-# until an operator saves Deposit addresses. Set the RPC endpoints as Worker secrets.
-[vars]
-ETH_RECIPIENT = ""
-SOL_RECIPIENT = ""
+# Admin → Deposit addresses works without a [vars] section. To supply deployment
+# defaults, uncomment [vars] and the address for each network you want to accept.
+# Set the corresponding ETH_RPC_URL or SOL_RPC_URL separately as a Worker secret.
+# Chat starts closed. Open access in Plan settings and approve accounts in Users.
+# [vars]
+# ETH_RECIPIENT = "your-public-ethereum-address"
+# SOL_RECIPIENT = "your-public-solana-address"
 
 [[durable_objects.bindings]]
 name = "LEDGER"

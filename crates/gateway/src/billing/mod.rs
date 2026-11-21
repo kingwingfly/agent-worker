@@ -9,10 +9,10 @@ use serde_json::{Value, json};
 use wasm_bindgen::JsValue;
 use worker::{Env, Headers, Method, RequestInit, Response, Result};
 
-use crate::platform::expect_ok;
+use crate::platform::{error, expect_ok};
 
 pub const PAYER_HEADER: &str = "x-billing-payer";
-pub const HELP: &str = "\n/account — balance and private account sign-in\n/topup 5 — buy $5 of tokens with Stars\n/subscribe — pay monthly from your wallet for 5× weekly usage\n/unsubscribe — stop monthly renewal\n/paysupport — payment support\nOperators can review saved chats and output files.";
+pub const HELP: &str = "\n/apply — request access in private\n/account — access status, usage and private account sign-in\n/unsubscribe — stop monthly renewal\n/paysupport — account and payment support\nOperators can review saved chats and output files.";
 
 async fn post(env: &Env, action: &str, body: Value) -> Result<Response> {
     let headers = Headers::new();
@@ -24,6 +24,17 @@ async fn post(env: &Env, action: &str, body: Value) -> Result<Response> {
     env.service("BILLING")?
         .fetch(format!("https://billing/{action}"), Some(init))
         .await
+}
+
+pub async fn member_allowed(env: &Env, user: &str) -> Result<bool> {
+    match post(env, "welcome", json!({ "user": user }))
+        .await?
+        .status_code()
+    {
+        200 => Ok(true),
+        403 => Ok(false),
+        _ => Err(error("chat membership is unavailable")),
+    }
 }
 
 pub async fn record(

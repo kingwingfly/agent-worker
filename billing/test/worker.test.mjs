@@ -89,13 +89,19 @@ test('Worker authority boundaries, verified checkout, concurrent claims, and sco
   }
   assert.equal((await get('/api/account')).status,401)
   const publicPrices = await data(await get('/api/pricing'))
+  assert.equal(publicPrices.plan.require_payment,false)
+  const settings=await data(await adminGet('/admin/api/settings'))
+  assert.equal(settings.access_mode,'closed')
+  assert.equal(publicPrices.plan.access_mode,'closed')
   assert.equal(publicPrices.plan.input_usd,'1.00')
   assert.deepEqual(publicPrices.chains,[])
   assert.equal(publicPrices.wallet_tokens,undefined)
   assert.equal((await adminPost('/admin/api/users',{id:user},{origin:'https://unrelated.test'})).status,403)
   assert.equal((await gateway('/admin/api/settings',{})).status,404)
 
-  const {text} = await data(await gateway('/account',{user}))
+  const {text} = await data(await gateway('/account',{user,profile:{name:'Ada',username:'ada_test'}}))
+  assert.match(text,/Chat access is closed/)
+  assert.doesNotMatch(text,/\/topup/)
   const code = text.match(/[0-9a-f-]{36}/)[0]
   const login = await send('/api/login',{code})
   const cookieHeader = login.headers.get('set-cookie')
@@ -107,11 +113,33 @@ test('Worker authority boundaries, verified checkout, concurrent claims, and sco
   assert.equal(blocked.status,403)
 
   assert.deepEqual((await data(await get('/api/account',customer))).chains,[])
-  assert.equal((await send('/api/invoice',{chain:'ETH',usd:'10'},customer)).status,503)
+  assert.equal((await send('/api/invoice',{chain:'ETH',usd:'10'},customer)).status,403)
+  assert.equal((await gateway('/topup',{user,usd:'1'})).status,403)
+  assert.equal((await send('/api/apply',{})).status,401)
+  assert.equal((await send('/api/apply',{user:'4321'},customer)).status,400)
+  assert.equal((await gateway('/apply',{user:'321',note:'Testing'})).status,200)
+  await data(await adminPost('/admin/api/users/321/access',{status:'declined',expected:'pending'}))
+  assert.equal((await data(await gateway('/apply',{user:'321'}))).status,'declined')
+  await data(await adminPost('/admin/api/users',{id:'888',approve:true}))
+  assert.equal((await data(await adminGet('/admin/api/users/888'))).approval_status,'approved')
+  for (let i=0;i<2;i++) assert.equal((await data(await send('/api/apply',{note:'Research'},customer))).status,'pending')
+  const pending=await data(await adminGet('/admin/api/applications'))
+  assert.equal(pending.applications.length,1)
+  assert.deepEqual([pending.applications[0].user,pending.applications[0].name,pending.applications[0].username,pending.applications[0].note],[user,'Ada','ada_test','Research'])
   const deposit = {eth_recipient:recipient,sol_recipient:solAddress}
   assert.equal((await adminPost('/admin/api/deposits',{...deposit,sol_recipient:'a private key'})).status,400)
   assert.equal((await data(await adminGet('/admin/api/deposits'))).eth_recipient,'')
   assert.equal((await data(await adminPost('/admin/api/deposits',deposit))).networks.SOL.ready,true)
+  assert.equal((await data(await get('/api/pricing'))).plan.access_mode,'closed')
+  await data(await adminPost('/admin/api/settings',{access_mode:'paid'}))
+  assert.equal((await gateway('/access',{user})).status,403)
+  const decision='/admin/api/users/'+user+'/access'
+  assert.equal((await send(decision,{status:'approved'},customer)).status,403)
+  await data(await adminPost(decision,{status:'approved',expected:'pending'}))
+  assert.equal((await adminPost(decision,{status:'declined',expected:'pending'})).status,409)
+  assert.equal((await data(await adminGet('/admin/api/applications'))).applications.length,0)
+  assert.deepEqual((await data(await adminGet('/admin/api/users?approval=approved'))).users.map(row => row.id).sort(),[user,'888'].sort())
+  assert.equal((await data(await get('/api/pricing'))).plan.require_payment,true)
   ethChain = '0xaa36a7'
   await data(await send('/api/invoice',{chain:'ETH',usd:'30'},customer),503)
   ethChain = '0x1'
@@ -134,7 +162,8 @@ test('Worker authority boundaries, verified checkout, concurrent claims, and sco
   const reused = send('/api/invoice',{chain:'ETH',usd:'30'},customer)
   await started.promise
   try {
-    await data(await adminPost('/admin/api/deposits',{...deposit,eth_recipient:''}))
+    const removed=await data(await adminPost('/admin/api/deposits',{eth_recipient:'',sol_recipient:''}))
+    assert.equal(removed.mode,'closed')
     const claims = await Promise.all([1,2].map(() => send('/api/claim',{id:quote.id,tx},customer).then(r => data(r,202))))
     assert.deepEqual(claims.map(r => r.status),['confirming','confirming'])
   } finally {
@@ -144,6 +173,7 @@ test('Worker authority boundaries, verified checkout, concurrent claims, and sco
   assert.equal(refreshed.id,quote.id)
   assert.equal(refreshed.status,'confirming')
   assert.equal(refreshed.tx,tx)
+  assert.equal(refreshed.accepts_payment,false)
   assert.equal((await data(await get('/api/account',customer))).invoices[0].status,'confirming')
   finalized = true
   // No further claims are submitted. The persisted alarm settles after finality on its own.
@@ -155,6 +185,14 @@ test('Worker authority boundaries, verified checkout, concurrent claims, and sco
   }
   assert.deepEqual(await data(await send('/api/claim',{id:quote.id,tx},customer)),{status:'paid'})
   assert.equal(account.subscriptions.length,0)
+  assert.equal(account.available_tokens,0)
+  assert.equal(account.wallet_tokens,30_000_000)
+  assert.equal((await send('/api/subscribe',{offer:account.plan.offer,key:crypto.randomUUID()},customer)).status,403)
+  await data(await adminPost('/admin/api/deposits',{sol_recipient:solAddress}))
+  assert.equal((await data(await get('/api/pricing'))).plan.access_mode,'closed')
+  await data(await adminPost('/admin/api/settings',{access_mode:'paid'}))
+  account=await data(await get('/api/account',customer))
+  assert.deepEqual(account.chains,['SOL'])
   assert.equal(account.available_tokens,30_100_000)
   assert.equal((await data(await adminGet('/admin/api/overview'))).payments,1)
   const order = {offer:account.plan.offer,key:crypto.randomUUID()}
@@ -183,6 +221,19 @@ test('Worker authority boundaries, verified checkout, concurrent claims, and sco
   assert.equal(cancelled.tier,'subscriber')
   assert.equal(cancelled.subscriptions[0].auto_renew,false)
   assert.equal(cancelled.wallet_tokens,paid.wallet_tokens)
+  assert.equal((await data(await adminPost('/admin/api/settings',{access_mode:'free'}))).mode,'free')
+  assert.equal((await adminPost('/admin/api/settings',{access_mode:'paid',expected_access_mode:'closed'})).status,409)
+  assert.equal((await data(await adminPost('/admin/api/settings',{input_cost:1}))).mode,'free')
+  const free=await data(await get('/api/account',customer))
+  assert.deepEqual(free.chains,[])
+  assert.equal(free.available_tokens,null)
+  assert.equal(free.wallet_tokens,paid.wallet_tokens)
+  assert.equal((await send('/api/invoice',{chain:'SOL',usd:'1'},customer)).status,409)
+  await data(await adminPost(decision,{status:'revoked',expected:'approved'}))
+  assert.equal((await gateway('/access',{user})).status,403)
+  assert.equal((await data(await send('/api/apply',{},customer))).status,'revoked')
+  await data(await adminPost(decision,{status:'approved',expected:'revoked'}))
+  assert.equal((await data(await adminPost('/admin/api/settings',{access_mode:'paid'}))).mode,'paid')
 
   const turn = crypto.randomUUID(), session = 'tg:-23', at = Date.now()-1000
   const bucket = await mf.getR2Bucket('STATE','merchant')
@@ -253,6 +304,8 @@ test('the Durable Object alarm renews an idle subscriber once without a customer
   const {text} = await data(await send('/internal/account',{user}))
   const login = await send('/api/login',{code:text.match(/[a-f0-9-]{36}/)[0]})
   const headers = {cookie:login.headers.get('set-cookie').split(';')[0]}
+  await data(await send('/admin/api/settings',{allow_stars_only:true,access_mode:'paid'}))
+  await data(await send('/admin/api/users/'+user+'/access',{status:'approved'}))
   await data(await send('/admin/api/users/'+user+'/adjust',{action:'airdrop',tokens:2_000_000,reason:'Fixture',key:crypto.randomUUID()}))
   const {plan} = await data(await stub.fetch('https://ledger/api/pricing'))
   await data(await send('/api/subscribe',{offer:plan.offer,key:crypto.randomUUID()},headers))

@@ -28,7 +28,7 @@ Telegram ──webhook──▶ Worker
 
 ## Optional paid service
 
-The optional billing Worker sells tokens by dollar amount through ETH, SOL or Telegram Stars. Operators set input and output prices per million tokens and the free weekly allowance. Users can chat from their wallet or pay for a monthly subscription with five times the free weekly allowance. The Cloudflare Access-protected dashboard manages pricing, deposit addresses, users, subscriptions, chat history and output files. The gateway ships with `BILLING_ENABLED = "false"`. [Billing setup and payment flows](billing/README.md)
+With the optional billing Worker enabled, chat starts closed. Users send `/apply` in Telegram or apply from the signed-in checkout. Admins review applications, manage the whitelist and explicitly open paid or free chat. Paid accounts buy tokens by dollar amount through ETH, SOL or Telegram Stars, then spend them on chat or a monthly subscription with five times the free weekly allowance. The Cloudflare Access-protected dashboard manages prices, optional deposit addresses, quotas, subscriptions, chat history and output files. The gateway ships with `BILLING_ENABLED = "false"`. [Access setup and payment guide](billing/README.md)
 
 ## How a message is handled
 

@@ -48,6 +48,7 @@ function signedOut() {
   current = null;
   review = null;
   transfers.clear();
+  byId("apply-form").reset();
   invoicePages.show([], null);
   byId("login-screen").hidden = false;
   byId("customer-account").hidden = true;
@@ -85,13 +86,18 @@ async function publicPricing() {
   try {
     const {plan, chains} = await api("/api/pricing");
     retry.hidden = true;
+    byId("pricing-intro").textContent = plan.require_payment ? "Buy tokens for chat or spend them on a monthly membership." : "";
+    if (plan.access_mode === "closed") {
+      offers.replaceChildren(element("h2", "Access is closed"), element("p", "You can apply now. The administrator must open chat and approve your account before you can use it."));
+      return;
+    }
     if (!plan.require_payment) {
-      offers.replaceChildren(element("h2", "Free access"), element("p", "Chat is free and new purchases are paused."));
+      offers.replaceChildren(element("h2", "Free access"), element("p", "Approved Telegram accounts can chat for free."));
       return;
     }
     const ways = chains.filter(chain => Object.hasOwn(networks, chain));
     const membership = plan.free_weekly_tokens > 0
-      ? `Free accounts receive ${number(plan.free_weekly_tokens)} tokens per week. ${usd(plan.monthly_usd)} per month raises that to ${number(plan.paid_weekly_tokens)} (5× free).`
+      ? `Approved accounts receive ${number(plan.free_weekly_tokens)} tokens per week. ${usd(plan.monthly_usd)} per month raises that to ${number(plan.paid_weekly_tokens)} (5× free).`
       : "Buy wallet tokens to use the service.";
     const methods = new Intl.ListFormat("en", { type: "disjunction" }).format([...ways, "Telegram Stars"]);
     const payment = ways.length ? "Pay with " + methods + "." : "Buy tokens with Telegram Stars in your private chat using /topup.";
@@ -121,6 +127,7 @@ function updateQuoteTotal() {
   const amount = amountEntered();
   const chain = byId("chain-options").querySelector(":checked")?.value;
   const stars = chain === "XTR";
+  byId("crypto-quote-help").hidden = stars;
   const total = amount ? walletTokens(amount, current.plan.input_usd) : 0n;
   byId("quote-total").textContent = amount ? `${usd(amount)} buys ${number(total)} wallet tokens.` : "Enter $0.01 to $10,000.00.";
   byId("new-invoice").hidden = stars;
@@ -241,7 +248,15 @@ function displayAccount(data) {
   byId("customer-account").hidden = false;
   byId("logout").hidden = false;
   byId("wallet-balance").textContent = number(data.wallet_tokens);
-  byId("balance").textContent = number(data.available_tokens);
+  const approved = data.approval_status === "approved" && !data.blocked;
+  byId("balance").textContent = data.blocked ? "Blocked" : plan.access_mode === "closed" ? "Closed" : !approved ? "Approval required" : plan.require_payment ? number(data.available_tokens) : "Unlimited";
+  byId("balance-unit").hidden = !approved || !plan.require_payment;
+  byId("weekly-allowance").hidden = !approved || !plan.require_payment;
+  byId("application").hidden = approved || data.blocked;
+  byId("apply-form").hidden = data.approval_status !== "none" || data.blocked;
+  const applicationStatus = {none: "Apply with your signed-in Telegram account.", pending: "Your application is waiting for review.",
+    declined: "Your application was declined. Contact payment support for help.", revoked: "Your access was revoked. Contact payment support for help."};
+  byId("application-status").textContent = applicationStatus[data.approval_status] || "";
   byId("tier-label").textContent = (data.tier === "subscriber" ? "Subscriber" : "Free") + " weekly tokens";
   byId("weekly-balance").textContent = `${number(data.remaining_weekly_tokens)} of ${number(data.allowance_tokens)} left`;
   byId("next-refill").textContent = data.next_refill ? "Refills " + when(data.next_refill) : "";
@@ -250,14 +265,15 @@ function displayAccount(data) {
   const active = monthlyMember(), previous = data.subscriptions.filter(row => row.id !== active?.id);
   byId("past-memberships").hidden = !previous.length;
   byId("my-subscriptions").replaceChildren(...previous.map(subscription));
-  salesPaused = plan.require_payment === false || data.blocked;
+  salesPaused = !plan.require_payment || !approved;
   byId("top-up").hidden = salesPaused;
   byId("membership").hidden = salesPaused && !active;
   byId("buy-options").hidden = salesPaused && !active;
-  byId("access-message").hidden = !salesPaused;
+  byId("access-message").hidden = !salesPaused || (!approved && !data.blocked && plan.access_mode !== "closed");
   byId("access-message").textContent = data.blocked
     ? "Account access is blocked. Contact payment support for help."
-    : salesPaused ? "Chat is free and new purchases are paused." : "";
+    : plan.access_mode === "closed" ? "Chat access is closed. Your wallet and past invoices are available here."
+    : salesPaused ? "Chat is free. Your wallet tokens are saved and new purchases are paused." : "";
   byId("wallet-rates").replaceChildren(rateList(plan), element("p", usageExample(plan), "hint"));
   setChains(data.chains);
   showPlan();
@@ -283,16 +299,31 @@ async function account(page = invoicePages.cursors) {
   const after = page.at(-1);
   const data = await customerApi("/api/account" + (after ? "?after=" + encodeURIComponent(after) : ""));
   if (identity !== identityVersion || version !== accountVersion) return;
+  const previous = current?.invoices.find(i => i.id === visibleInvoice);
+  const previouslyPaused = salesPaused;
   invoicePages.show(page, data.invoices_next);
   displayAccount(data);
   if (data.invoices.some(i => i.status === "confirming")) {
     refreshTimer = setTimeout(() => account().catch(error => notice(error.message, true)), 15000);
   }
   const selected = data.invoices.find(i => i.id === visibleInvoice);
-  if (selected && (settled(selected) || selected.note || selected.status === "confirming" || salesPaused)) showInvoice(selected, false);
+  if (selected && (previous?.status !== selected.status || previous?.tx !== selected.tx || previous?.note !== selected.note
+    || previous?.accepts_payment !== selected.accepts_payment || previouslyPaused !== salesPaused)) showInvoice(selected, false);
+  return data;
 }
 
 byId("quote-form").elements.usd.addEventListener("input", updateQuoteTotal);
+byId("apply-form").addEventListener("submit", event => {
+  event.preventDefault();
+  const form = event.currentTarget, version = identityVersion;
+  busy(event.submitter, async () => {
+    await customerApi("/api/apply", {note: form.elements.note.value.trim()});
+    if (version === identityVersion) {
+      form.reset();
+      await account();
+    }
+  });
+});
 byId("chain-options").addEventListener("change", updateQuoteTotal);
 byId("refresh-account").addEventListener("click", event => busy(event.currentTarget, account));
 byId("review-plan").addEventListener("click", () => {
@@ -377,8 +408,19 @@ async function payEth(invoice, beforeSend) {
     throw new Error("The invoice contains an invalid Ethereum address or transfer reference.");
   }
   const tx = {from: accounts[0], to: invoice.recipient, value: "0x" + wei(invoice.amount).toString(16), data: invoice.reference, chainId: "0x1"};
-  beforeSend();
+  await beforeSend();
   return provider.request({method: "eth_sendTransaction", params: [tx]});
+}
+
+async function beginTransfer(invoice, key, version) {
+  const data = await account();
+  if (!data || version !== identityVersion || visibleInvoice !== invoice.id) throw new Error("Reopen this invoice before paying.");
+  const latest = data.invoices.find(row => row.id === invoice.id);
+  if (salesPaused || !latest?.accepts_payment || latest.status !== "open" || latest.expires_at <= Date.now()) {
+    throw new Error("This invoice is no longer accepting new transfers. You can still verify a payment you already sent.");
+  }
+  if (latest.tx || savedTransfer(key) !== null) throw new Error("Check your wallet activity for the existing transfer.");
+  saveTransfer(key, "");
 }
 
 function showInvoice(invoice, focus = true) {
@@ -406,7 +448,8 @@ function showInvoice(invoice, focus = true) {
     field(details, "Status", invoice.status);
     if (invoice.tx) field(details, "Transaction", invoice.tx, true);
     content.append(details);
-    if (!crypto && invoice.status === "open") content.append(element("p", "Complete this Telegram Stars payment in your private chat with the bot."));
+    if (!crypto && invoice.status === "open") content.append(element("p", salesPaused || !invoice.accepts_payment
+      ? "New purchases are paused." : "Complete this Telegram Stars payment in your private chat with the bot."));
     return;
   }
 
@@ -414,18 +457,21 @@ function showInvoice(invoice, focus = true) {
   field(details, "Network", networks[invoice.chain] + " mainnet");
   field(details, "Recipient address", invoice.recipient, true);
   field(details, isEth ? "Transaction data (hex)" : "Transfer memo", invoice.reference, true);
-  field(details, "Quote expires", when(invoice.expires_at));
+  field(details, "Transfer must land by (UTC)", new Date(invoice.expires_at).toISOString().slice(0,19).replace("T", " "));
   content.append(details);
+  const enabled = !salesPaused && invoice.accepts_payment;
   const message = invoice.note || (invoice.status === "confirming"
     ? "Transaction ID submitted. Verification continues after you close checkout."
-    : salesPaused
-    ? "New sales are paused. You can still verify a transfer sent within this invoice’s quote window."
+    : !enabled
+    ? "Payments to this destination are paused. You can still verify a transfer that landed within the quote window."
     : expired
     ? "The transfer window has closed. You can still verify a transfer made within the quote window."
     : attempt !== null || invoice.tx
     ? "Check your wallet activity and verify the transfer you already sent using its transaction ID below."
     : `Send the exact native ${invoice.chain} amount to this address on ${networks[invoice.chain]} mainnet before the quote expires. Include the ${isEth ? "hex transaction data" : "memo"} exactly as shown and pay the network fee separately.`);
-  content.append(element("p", message));
+  const timing = isEth ? "Ethereum finality usually takes about 15 minutes after inclusion."
+    : "Solana finality typically takes about 13–20 seconds after confirmation.";
+  content.append(element("p", message), element("p", timing + " Finality can come after the deadline. Once you submit the transaction ID, we keep checking for up to 24 hours.", "hint"));
   const actions = element("div", null, "transfer-actions");
   content.append(actions);
   const form = element("form", null, "claim stack");
@@ -445,7 +491,7 @@ function showInvoice(invoice, focus = true) {
   form.append(label, element("p", help, "hint"), verify);
   content.append(form);
 
-  const canPay = !salesPaused && !expired && !invoice.tx && invoice.status === "open";
+  const canPay = enabled && !expired && !invoice.tx && invoice.status === "open";
   if (canPay && attempt === "" && !signing.has(key)) {
     actions.append(button("I haven’t sent a transfer", () => {
       saveTransfer(key, null);
@@ -457,11 +503,9 @@ function showInvoice(invoice, focus = true) {
       const version = identityVersion;
       let hash;
       try {
-        hash = await payEth(invoice, () => {
-          if (version !== identityVersion || visibleInvoice !== invoice.id) throw new Error("Reopen this invoice to pay.");
-          if (savedTransfer(key) !== null) throw new Error("Check your wallet activity for the existing transfer.");
+        hash = await payEth(invoice, async () => {
+          await beginTransfer(invoice, key, version);
           signing.add(key);
-          saveTransfer(key, "");
         });
         saveTransfer(key, hash);
       } catch (error) {
@@ -469,7 +513,8 @@ function showInvoice(invoice, focus = true) {
         throw error;
       } finally {
         signing.delete(key);
-        if (version === identityVersion && visibleInvoice === invoice.id) showInvoice(invoice, false);
+        const latest = current?.invoices.find(row => row.id === invoice.id);
+        if (version === identityVersion && visibleInvoice === invoice.id && latest) showInvoice(latest, false);
       }
       if (version === identityVersion) await claimPayment(invoice, hash, version);
     }, "button");
@@ -480,15 +525,14 @@ function showInvoice(invoice, focus = true) {
     const params = new URLSearchParams({amount: invoice.amount, memo: invoice.reference});
     pay.href = `solana:${invoice.recipient}?${params}`;
     pay.addEventListener("click", event => {
-      if (invoice.expires_at <= Date.now()) {
-        event.preventDefault();
-        notice("This quote expired. Create a new invoice before sending a transfer.", true);
-        return;
-      }
-      if (savedTransfer(key) !== null) event.preventDefault();
-      else saveTransfer(key, "");
-      // Let the browser hand the link to the wallet before updating this panel.
-      setTimeout(() => { if (visibleInvoice === invoice.id) showInvoice(invoice, false); }, 0);
+      const navigate = !event.defaultPrevented;
+      event.preventDefault();
+      const version = identityVersion;
+      busy(null, async () => {
+        await beginTransfer(invoice, key, version);
+        if (navigate) location.assign(pay.href);
+        showInvoice(invoice, false);
+      });
     });
     actions.append(pay);
   }

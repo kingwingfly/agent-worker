@@ -38,7 +38,7 @@ h1, h2, h3 { font-weight: 850; line-height: 1.17; }
 h1 { font-size: clamp(2.1rem, 4.5vw, 3.2rem); letter-spacing: -.045em; overflow-wrap: anywhere; }
 h2 { font-size: 1.45rem; letter-spacing: -.025em; }
 h3 { font-size: 1.06rem; }
-button, input { font: inherit; }
+button, input, select { font: inherit; }
 button, .button {
   display: inline-flex;
   justify-content: center;
@@ -63,8 +63,8 @@ button:disabled, fieldset:disabled button { opacity: .65; cursor: default; box-s
 .secondary:hover { background: var(--blue-light); }
 .danger { background: var(--danger); border-color: #80183c; box-shadow: 0 2px 0 #80183c; }
 .danger:hover { background: #80183c; }
-:where(button, a, input, summary, [tabindex="-1"]):focus-visible { outline: 3px solid #285cb6; outline-offset: 3px; }
-input:not([type="radio"],[type="checkbox"]) {
+:where(button, a, input, select, summary, [tabindex="-1"]):focus-visible { outline: 3px solid #285cb6; outline-offset: 3px; }
+input:not([type="radio"],[type="checkbox"]), select {
   width: 100%; min-width: 0; min-height: 2.75rem;
   border: 1px solid #97a7ca; border-radius: .65rem; background: #fcfdff; color: var(--ink);
   padding: .48rem .75rem; font-size: 1rem;

@@ -1,7 +1,7 @@
 export const WEEK = 7 * 86_400_000
 export const HOUR = 3_600_000
 export const defaults = {
-  require_payment: true, input_usd: '1.00', output_usd: '2.00',
+  access_mode: 'closed', allow_stars_only: false, input_usd: '1.00', output_usd: '2.00',
   free_weekly_tokens: 100_000, monthly_usd: '1.00', stars_per_usd: 50,
   input_cost: 0, output_cost: 0, cache_write_cost: 0, cache_read_cost: 0,
   support: 'Contact the operator who provided your account.'
@@ -41,7 +41,8 @@ export function amountCents(usd) {
 }
 export function settingsFrom(body) {
   const value = Object.fromEntries(Object.keys(defaults).map(key => [key, body[key]]))
-  check(typeof value.require_payment === 'boolean', 'Choose whether token metering is enabled.')
+  check(['closed', 'free', 'paid'].includes(value.access_mode), 'Choose closed, free or paid access.')
+  check(typeof value.allow_stars_only === 'boolean', 'Choose whether to allow Stars-only billing.')
   integer(value.free_weekly_tokens, 0, 1_000_000_000_000, 'free weekly tokens')
   integer(value.stars_per_usd, 1, 10_000, 'Stars per dollar')
   value.monthly_usd = dollars(amountCents(value.monthly_usd))
@@ -77,9 +78,17 @@ export function cost(usage, rates) {
     + usage.cache_creation_input_tokens * rates.cache_write_cost + usage.cache_read_input_tokens * rates.cache_read_cost) / 1_000_000
 }
 export function plan(settings) {
-  const { input_usd, output_usd, free_weekly_tokens, monthly_usd, require_payment, support, stars_per_usd } = settings
-  return { input_usd, output_usd, free_weekly_tokens, monthly_usd, require_payment, support, stars_per_usd,
+  const { input_usd, output_usd, free_weekly_tokens, monthly_usd, support, stars_per_usd } = settings
+  return { input_usd, output_usd, free_weekly_tokens, monthly_usd, support, stars_per_usd,
     paid_weekly_tokens: free_weekly_tokens * 5, plan_price_tokens: tokensForUsd(amountCents(monthly_usd), input_usd),
     offer: ['monthly', input_usd, output_usd, free_weekly_tokens, monthly_usd].join('/') }
 }
 export const exhausted = 'There are too few tokens for this request. Send /topup in private to add tokens or /account to see your next weekly refill.'
+export const accessClosed = 'Chat access is closed. The administrator must open access before you can chat or make a new purchase. Send /apply in private to request approval.'
+export const applicationMessages = {
+  none: 'You need approval to use chat. Send /apply in private to request access.',
+  pending: 'Your access application is waiting for admin review.',
+  approved: 'Your Telegram account is on the whitelist.',
+  declined: 'Your access application was declined. Contact the operator via /paysupport for help.',
+  revoked: 'Your chat access was revoked. Contact the operator via /paysupport for help.'
+}

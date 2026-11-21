@@ -405,6 +405,19 @@ pub async fn mcp(request: Request, env: &Env, cfg: &Config) -> Result<Response> 
     if admission.status_code() != 200 {
         return Ok(admission);
     }
+    if cfg.billing_enabled {
+        let user = admission
+            .headers()
+            .get(billing::PAYER_HEADER)?
+            .ok_or_else(|| error("missing payer"))?;
+        if !billing::member_allowed(env, &user).await? {
+            return refused(
+                403,
+                "permission_error",
+                "Chat access is closed or this account has no access.",
+            );
+        }
+    }
     let url = request.url()?;
     let query = url
         .query()

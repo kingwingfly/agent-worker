@@ -460,9 +460,14 @@ impl DurableObject for SessionDO {
             let cfg = self.inner.cfg()?;
             return match self.inner.refusal(asked, &cfg)? {
                 Some(refusal) => Response::error("refused", refusal.status()),
-                None if asked.spends && cfg.billing_enabled => {
+                None if cfg.billing_enabled => {
                     let session = self.inner.session.borrow();
-                    let Some(user) = session.payer().filter(|payer| {
+                    let payer = if asked.spends {
+                        session.payer()
+                    } else {
+                        session.payer().or(session.token_payer)
+                    };
+                    let Some(user) = payer.filter(|payer| {
                         cfg.dev_runner_url.is_some() || session.token_payer == Some(*payer)
                     }) else {
                         return Response::error("no active payer", 403);

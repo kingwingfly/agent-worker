@@ -62,6 +62,7 @@ impl Chat {
 pub struct User {
     pub id: i64,
     pub first_name: Option<String>,
+    pub username: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

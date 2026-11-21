@@ -48,11 +48,11 @@ export function migrateWallet(book) {
     cursor = batch.at(-1).id
   }
   const settings = { ...defaults, free_weekly_tokens: (old.free_credits ?? 100) * ratio }
-  for (const key of ['require_payment','input_cost','output_cost','cache_write_cost','cache_read_cost','support']) {
+  for (const key of ['input_cost','output_cost','cache_write_cost','cache_read_cost','support']) {
     if (old[key] != null) settings[key] = old[key]
   }
   if (old.stars_price && old.pack_usd) settings.stars_per_usd = Math.min(10_000, Math.max(1, Math.round(old.stars_price / Number(old.pack_usd))))
-  book.configure(settings)
+  return settings
 }
 
 export function legacyCharge(tokens, call) {

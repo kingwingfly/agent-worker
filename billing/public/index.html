@@ -16,13 +16,14 @@
     <p class="notice" id="notice" role="status" aria-live="polite" hidden></p>
     <section id="login-screen">
       <div class="pricing-banner">
-        <div><h1>Token pricing</h1><p>Buy tokens for chat or spend them on a monthly membership.</p></div>
+        <div><h1>Your chat account</h1><p id="pricing-intro"></p></div>
         <div class="mascot" aria-hidden="true"><img src="/assets/wallet-cat.webp" width="446" height="526" alt=""></div>
       </div>
       <div class="welcome-grid">
         <section class="panel stack sign-in">
           <h2>Sign in</h2>
           <p class="muted">Send <code>/account</code> in your private chat with the bot, then enter your one-time code.</p>
+          <p class="hint">To request access, send <code>/apply</code> to the bot or apply after signing in.</p>
           <form id="login" class="stack">
             <label>Sign-in code <input name="code" type="text" required autocomplete="one-time-code" autocapitalize="none" spellcheck="false"></label>
             <button>Continue</button>
@@ -38,12 +39,19 @@
     <section id="customer-account" hidden>
       <div class="page-heading"><h1>Your tokens</h1><div class="actions"><span class="muted" id="user-id"></span><button id="refresh-account" type="button" class="secondary">Refresh</button></div></div>
       <div class="balance wallet-strip">
-        <div><p>Available for chat</p><strong id="balance"></strong><span>tokens</span></div>
+        <div><p>Available for chat</p><strong id="balance"></strong><span id="balance-unit">tokens</span></div>
         <div><p>Wallet</p><b id="wallet-balance"></b><span>tokens</span></div>
-        <div><p id="tier-label">Weekly allowance</p><b id="weekly-balance"></b><small id="next-refill"></small></div>
+        <div id="weekly-allowance"><p id="tier-label">Weekly allowance</p><b id="weekly-balance"></b><small id="next-refill"></small></div>
         <img class="wallet-mascot" src="/assets/wallet-cat.webp" width="446" height="526" alt="">
       </div>
       <p id="access-message" class="panel" hidden></p>
+      <section id="application" class="panel stack" hidden>
+        <h2>Chat access</h2><p id="application-status"></p>
+        <form id="apply-form" class="stack" hidden>
+          <label>Note to the administrator (optional) <input name="note" maxlength="500"></label>
+          <button>Apply for access</button>
+        </form>
+      </section>
       <div class="customer-grid" id="buy-options">
         <section id="top-up" class="panel plan-preview stack">
           <h2>Buy tokens</h2>
@@ -52,6 +60,7 @@
             <label>Amount (USD) <input required type="number" inputmode="decimal" min="0.01" max="10000" step="0.01" value="5.00" name="usd"></label>
             <p id="quote-total" class="quote-tokens" aria-live="polite"></p>
             <fieldset id="networks"><legend>Pay with</legend><div id="chain-options"></div></fieldset>
+            <p class="hint" id="crypto-quote-help">Your quote locks the Coinbase USD rate for 15 minutes. Your wallet pays the network fee separately.</p>
             <button id="new-invoice">Get payment quote</button>
             <p id="stars-help" class="hint" hidden></p>
           </form>

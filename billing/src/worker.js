@@ -10,11 +10,11 @@ import mascot from '../public/assets/wallet-cat.webp'
 import nunito from '../public/assets/nunito-latin.woff2'
 import fontLicense from '../public/assets/nunito-OFL.txt'
 import { checkPaymentNetwork, spotRate, transactionId, verify } from './chain.js'
-import { check, HOUR, integer, plan, Problem, userId, uuid } from './policy.js'
+import { applicationMessages, check, HOUR, integer, plan, Problem, userId, uuid } from './policy.js'
 
 const NO_STORE = { 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer' }
 const SESSION = '__Host-billing'
-const INTERNAL = new Set(['/access', '/reserve', '/settle', '/record', '/welcome', '/account', '/topup', '/subscribe', '/unsubscribe', '/support', '/stars'])
+const INTERNAL = new Set(['/access', '/reserve', '/settle', '/record', '/welcome', '/account', '/apply', '/topup', '/subscribe', '/unsubscribe', '/support', '/stars'])
 const TEXT_FILE = /\.(?:txt|md|csv|tsv|json|jsonl|log|ya?ml|toml|xml|py|rs|js|ts|css|sql|sh)$/i
 const PREVIEW_BYTES = 32 * 1024
 // Serve these small files directly so Cloudflare delivers its authenticated Access
@@ -109,7 +109,7 @@ export default {
 export class BillingLedger extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env)
-    this.book = this.atomic(() => new Ledger(ctx.storage.sql))
+    this.book = this.atomic(() => new Ledger(ctx.storage.sql, env))
   }
   atomic(action) { return this.ctx.storage.transactionSync(action) }
   fetch(request) {
@@ -145,18 +145,28 @@ export class BillingLedger extends DurableObject {
         return json({ ok: true }, 200, { 'Set-Cookie': this.cookie('', 0) })
       }
       const user = auth.user
+      if (post && path === '/api/apply') {
+        check(Object.keys(body).every(key => key === 'note'), 'Applications use the Telegram identity of your signed-in account.')
+        return json(this.atomic(() => book.apply(user, body.note ?? '', now)))
+      }
       if (get && path === '/api/account') {
-        const detail = this.atomic(() => book.account(user, now))
-        return json({ ...detail, ...this.catalog(), ...book.payments(user, now, url.searchParams.get('after')) })
+        const settings = book.settings(), options = book.paymentOptions(settings)
+        const detail = this.atomic(() => book.account(user, now, options))
+        return json({ ...detail, ...this.catalog(settings, options), ...book.payments(user, now, url.searchParams.get('after'), options) })
       }
       if (post && path === '/api/invoice') {
         check(['ETH','SOL'].includes(body.chain), 'Choose ETH or SOL.')
-        const issue = (at, rate) => this.atomic(() => book.invoice(user, body.chain, this.env, at, body.usd, rate))
+        const issue = (at, rate) => this.atomic(() => book.invoice(user, body.chain, at, body.usd, rate))
         const existing = issue(now, null)
         const [rate] = await Promise.all([existing ? null : spotRate(body.chain), checkPaymentNetwork(body.chain, this.env)])
         // Another checkout can submit or settle this invoice while the RPC is responding.
         const order = existing ? book.order(existing.id, user) : issue(Date.now(), rate)
-        return json(book.showOrder(order, Date.now()))
+        const invoice = book.showOrder(order, Date.now())
+        if (existing && invoice.status === 'open' && !invoice.tx) {
+          book.checkMember(user)
+          check(invoice.accepts_payment, 'Payment settings changed. Refresh your account for current payment methods.', 409)
+        }
+        return json(invoice)
       }
       if (post && path === '/api/subscribe') {
         await this.schedule(monthsAfter(now, 1))
@@ -170,9 +180,9 @@ export class BillingLedger extends DurableObject {
       throw new Problem(404, 'Not found.')
     })
   }
-  catalog() {
-    const networks = this.book.deposits(this.env).networks
-    return { plan: plan(this.book.settings()), chains: ['ETH', 'SOL'].filter(chain => networks[chain].ready) }
+  catalog(settings = this.book.settings(), options = this.book.paymentOptions(settings)) {
+    const charging = options.mode === 'paid'
+    return { plan: { ...plan(settings), access_mode: options.mode, require_payment: charging }, chains: charging ? options.chains : [] }
   }
   async schedule(at) {
     if (at == null) return
@@ -213,9 +223,12 @@ export class BillingLedger extends DurableObject {
         throw new Problem(409, 'Another transaction is being checked for this invoice.')
       }
       const transient = !(err instanceof Problem) || [409,503].includes(err.status)
-      if (transient && Date.now() < job.submitted + 24 * HOUR) {
-        const delay = Math.min(HOUR, 5000 * 2 ** Math.min(job.attempts, 10))
-        book.run('UPDATE claims SET attempts=attempts+1,next_check=? WHERE invoice=? AND tx=?', Date.now()+delay, order.id, tx)
+      const now = Date.now(), deadline = job.submitted + 24 * HOUR
+      if (transient && now < deadline) {
+        const elapsed = now - job.submitted
+        const cap = order.chain === 'SOL' && elapsed < 60_000 ? 5000 : elapsed < 30 * 60_000 ? 60_000 : HOUR
+        const delay = Math.min(cap, 5000 * 2 ** Math.min(job.attempts, 10))
+        book.run('UPDATE claims SET attempts=attempts+1,next_check=? WHERE invoice=? AND tx=?', Math.min(deadline, now + delay), order.id, tx)
         return { status: 'confirming' }
       }
       const message = transient ? 'Confirmation timed out. Check the transaction ID and submit it again.' : err.message
@@ -253,15 +266,20 @@ export class BillingLedger extends DurableObject {
       const code = crypto.randomUUID(), hash = await tokenHash(code)
       return this.atomic(() => {
         book.enroll(body.user, now)
-        const detail = book.account(body.user, now), settings = book.settings()
+        book.identify(body.user, body.profile)
+        const detail = book.account(body.user, now)
         book.run("DELETE FROM logins WHERE (user=? AND kind='code') OR expires_at<=?", body.user, now)
         book.run("INSERT INTO logins VALUES (?,?,'code',?)", hash, body.user, now + 600_000)
-        return { text: `Available tokens: ${detail.available_tokens}. Wallet: ${detail.wallet_tokens} tokens. Weekly allowance: ${detail.remaining_weekly_tokens} of ${detail.allowance_tokens} remaining.`
-          + ` Next refill: ${new Date(detail.next_refill).toISOString().slice(0,16)} UTC.`
+        const approved = detail.approval_status === 'approved' && !detail.blocked
+        const metered = detail.access_mode === 'paid' && approved
+        const usage = detail.access_mode === 'closed' ? 'Chat access is closed.' : !approved ? 'Chat access requires an approved account.' : metered
+          ? `Available tokens: ${detail.available_tokens}. Weekly allowance: ${detail.remaining_weekly_tokens} of ${detail.allowance_tokens} remaining. Next refill: ${new Date(detail.next_refill).toISOString().slice(0,16)} UTC.`
+          : 'Chat is free with no weekly token limit. New purchases are paused.'
+        return { text: usage + ` Wallet: ${detail.wallet_tokens} tokens.`
+          + ' ' + applicationMessages[detail.approval_status]
           + (detail.blocked ? ' Your account is suspended.' : '')
-          + (settings.require_payment ? '' : ' The service is currently free.')
           + `\n\nPrivate account sign-in code (10 minutes):\n${code}`
-          + (settings.require_payment ? '\n\nSend /topup with a USD amount to buy tokens, or /subscribe to get 5× the free weekly allowance.' : '') }
+          + (metered && !detail.blocked ? '\n\nSend /topup with a USD amount to buy tokens.' + (detail.allowance_tokens ? ' Send /subscribe to get 5× the free weekly allowance.' : '') : '') }
       })
     }
     // Registration survives an admission denial, including when the starter quota is zero.
@@ -271,14 +289,20 @@ export class BillingLedger extends DurableObject {
       switch (action) {
         case 'welcome': {
           book.enroll(body.user, now)
+          book.checkMember(body.user)
           return { ok: true }
+        }
+        case 'apply': {
+          const result = book.apply(body.user, body.note ?? '', now)
+          book.identify(body.user, body.profile)
+          return result
         }
         case 'access': return book.access(body.user, now)
         case 'reserve': return book.reserve(body, now)
         case 'settle': return book.settle(body, now)
         case 'record': return book.record(body)
         case 'support': return { text: book.settings().support }
-        case 'topup': return book.showOrder(book.invoice(body.user, 'XTR', this.env, now, body.usd === undefined ? '5.00' : body.usd), now)
+        case 'topup': return book.showOrder(book.invoice(body.user, 'XTR', now, body.usd === undefined ? '5.00' : body.usd), now)
         case 'subscribe': return book.telegramPlan(body.user, body.quote, now)
         case 'unsubscribe': {
           const member = book.currentMembership(userId(body.user), now)
@@ -295,21 +319,26 @@ export class BillingLedger extends DurableObject {
     const book = this.book, get = method === 'GET', post = method === 'POST'
     if (get && route === 'overview') return json(book.overview(now))
     if ((get || post) && route === 'settings') {
-      const settings = get ? book.settings() : book.configure(body)
-      return json({ ...settings, ...plan(settings) })
+      const settings = get ? book.settings() : this.atomic(() => book.configure(body))
+      return json({ ...settings, ...plan(settings), mode: book.paymentOptions(settings).mode })
     }
-    if (get && route === 'deposits') return json(book.deposits(this.env))
-    if (post && route === 'deposits') return json(this.atomic(() => book.setDeposits(body, this.env)))
-    if (get && route === 'users') return json(book.users(query.get('q') || '', Number(query.get('offset') || 0)))
+    if (get && route === 'deposits') return json(book.paymentOptions())
+    if (post && route === 'deposits') return json(this.atomic(() => book.setDeposits(body)))
+    if (get && route === 'applications') return json(book.applications(Number(query.get('offset') || 0)))
+    if (get && route === 'users') return json(book.users(query.get('q') || '', Number(query.get('offset') || 0), query.get('approval') || ''))
     if (post && route === 'users') {
       const user = userId(body.id)
-      book.enroll(user, now)
+      this.atomic(() => {
+        book.enroll(user, now)
+        if (body.approve === true) book.reviewAccess(user, 'approved')
+      })
       return json({ id: user })
     }
-    const match = route.match(/^users\/(\d+)(?:\/(adjust|history|files|download|preview|storage|cleanup))?$/)
+    const match = route.match(/^users\/(\d+)(?:\/(access|adjust|history|files|download|preview|storage|cleanup))?$/)
     check(match, 'Not found.', 404)
     const user = userId(match[1]), action = match[2]
     book.user(user)
+    if (post && action === 'access') return json(this.atomic(() => book.reviewAccess(user, body.status, body.expected)))
     if (get && !action) return json(this.atomic(() => book.detail(user, now, query.get('after'))))
     if (post && action === 'adjust') return json(this.atomic(() => book.adjust(user, body, now)))
     if (get && action === 'history') {

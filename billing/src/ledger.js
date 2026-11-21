@@ -1,4 +1,4 @@
-import { amountCents, check, cost, defaults, dollars, exhausted, HOUR, integer, outputLimit, plan, settingsFrom, tokensForUsd, usageTokens, userId, units, uuid, WEEK } from './policy.js'
+import { accessClosed, amountCents, applicationMessages, check, cost, defaults, dollars, exhausted, HOUR, integer, outputLimit, plan, settingsFrom, tokensForUsd, usageTokens, userId, units, uuid, WEEK } from './policy.js'
 import { legacyCharge, migrateWallet } from './migration.js'
 import { nativeAmount, reference, validAddress } from './chain.js'
 
@@ -6,6 +6,9 @@ const schema = [
   'CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY, body TEXT NOT NULL)',
   'CREATE TABLE IF NOT EXISTS deposit_addresses (chain TEXT PRIMARY KEY, address TEXT NOT NULL)',
   'CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, created_at INTEGER, wallet_tokens INTEGER NOT NULL, blocked INTEGER DEFAULT 0)',
+  `CREATE TABLE IF NOT EXISTS chat_access (user TEXT PRIMARY KEY, status TEXT NOT NULL DEFAULT 'none',
+    name TEXT NOT NULL DEFAULT '', username TEXT NOT NULL DEFAULT '', note TEXT NOT NULL DEFAULT '', applied_at INTEGER)`,
+  'CREATE INDEX IF NOT EXISTS applications_pending ON chat_access(status,applied_at,user)',
   `CREATE TABLE IF NOT EXISTS subscriptions (id TEXT PRIMARY KEY, user TEXT, source TEXT, starts_at INTEGER,
     ends_at INTEGER, weekly INTEGER, window INTEGER, remaining INTEGER, revoked INTEGER DEFAULT 0)`,
   'CREATE TABLE IF NOT EXISTS weekly_usage (user TEXT PRIMARY KEY, window INTEGER, used INTEGER NOT NULL)',
@@ -50,10 +53,13 @@ const orders = `SELECT i.*,t.tokens,t.usd_cents,t.rate,c.tx AS submitted_tx,c.ne
   FROM invoices i LEFT JOIN topups t ON t.invoice=i.id LEFT JOIN claims c ON c.invoice=i.id`
 
 export class Ledger {
-  constructor(sql) {
+  constructor(sql, env = {}) {
     this.sql = sql
-    migrateWallet(this)
+    this.env = env
+    const migratedSettings = migrateWallet(this)
     for (const statement of schema) sql.exec(statement)
+    if (migratedSettings) this.configure(migratedSettings)
+    else this.reconcileAccess()
   }
   run(sql, ...params) { return this.sql.exec(sql, ...params) }
   all(sql, ...params) { return this.run(sql, ...params).toArray() }
@@ -65,29 +71,57 @@ export class Ledger {
     return Object.fromEntries(Object.entries(defaults).map(([key, value]) => [key, stored[key] ?? value]))
   }
   configure(body) {
-    const value = settingsFrom(body)
+    const previous = this.settings()
+    const value = settingsFrom({ ...previous, ...body })
+    check(!Object.hasOwn(body, 'expected_access_mode') || previous.access_mode === body.expected_access_mode || previous.access_mode === value.access_mode,
+      'Another administrator changed chat access. Refresh Plan settings before changing it again.', 409)
+    const options = this.paymentOptions(value)
+    // Opening is an operator action. Saving an address or a price never opens a closed service.
+    check(value.access_mode !== 'paid' || previous.access_mode === 'paid' || options.mode === 'paid',
+      'Configure a deposit address and its mainnet RPC, or enable Stars-only billing, before opening paid access.', 409)
     this.run('INSERT OR REPLACE INTO settings VALUES (1,?)', JSON.stringify(value))
-    return value
+    this.reconcileAccess(value, options)
+    return { ...value, access_mode: options.mode }
   }
-  deposits(env) {
-    const data = { networks: {} }
+  paymentOptions(settings = this.settings()) {
+    const data = { networks: {}, chains: [] }
+    const saved = new Map(this.all('SELECT chain,address FROM deposit_addresses').map(row => [row.chain, row.address]))
     for (const chain of ['ETH', 'SOL']) {
-      const row = this.one('SELECT address FROM deposit_addresses WHERE chain=?', chain)
-      const address = row?.address ?? env[chain + '_RECIPIENT'] ?? ''
-      const rpc = Boolean(env[chain + '_RPC_URL'])
+      const configured = this.env[chain + '_RECIPIENT']
+      const fallback = typeof configured === 'string' ? configured.trim() : ''
+      const address = saved.get(chain) ?? fallback
+      const endpoint = this.env[chain + '_RPC_URL']
+      const rpc = typeof endpoint === 'string' && /^https?:\/\//i.test(endpoint.trim()) && URL.canParse(endpoint)
+      const ready = rpc && validAddress(chain, address)
       data[chain.toLowerCase() + '_recipient'] = address
-      data.networks[chain] = { ready: rpc && validAddress(chain, address), rpc_configured: rpc }
+      data.networks[chain] = { ready, rpc_configured: rpc, overridden: saved.has(chain), default_address: fallback }
+      if (ready) data.chains.push(chain)
     }
+    data.mode = 'closed'
+    if (settings.access_mode === 'free') data.mode = 'free'
+    if (settings.access_mode === 'paid' && (data.chains.length || settings.allow_stars_only)) data.mode = 'paid'
     return data
   }
-  setDeposits(body, env) {
-    for (const [chain, field] of [['ETH','eth_recipient'], ['SOL','sol_recipient']]) {
-      check(typeof body[field] === 'string', 'Enter both receiving addresses or leave a network blank.')
-      const address = body[field].trim()
-      check(!address || validAddress(chain, address), 'Enter a valid public ' + chain + ' receiving address.')
-      this.run('INSERT OR REPLACE INTO deposit_addresses VALUES (?,?)', chain, address)
+  reconcileAccess(settings = this.settings(), options = this.paymentOptions(settings)) {
+    // Losing the last payment method closes the service until the operator explicitly reopens it.
+    if (options.mode !== settings.access_mode) {
+      this.run('UPDATE settings SET body=? WHERE id=1', JSON.stringify({ ...settings, access_mode: options.mode }))
     }
-    return this.deposits(env)
+    if (options.mode !== 'paid') this.run('UPDATE memberships SET renew=0 WHERE renew=1')
+    return options
+  }
+  setDeposits(body) {
+    for (const [chain, field] of [['ETH','eth_recipient'], ['SOL','sol_recipient']]) {
+      if (!Object.hasOwn(body, field)) continue
+      if (body[field] === null) this.run('DELETE FROM deposit_addresses WHERE chain=?', chain)
+      else {
+        check(typeof body[field] === 'string', 'Enter a receiving address or leave the network blank.')
+        const address = body[field].trim()
+        check(!address || validAddress(chain, address), 'Enter a valid public ' + chain + ' receiving address.')
+        this.run('INSERT OR REPLACE INTO deposit_addresses VALUES (?,?)', chain, address)
+      }
+    }
+    return this.reconcileAccess()
   }
   user(id) {
     const user = this.one('SELECT * FROM users WHERE id=?', userId(id))
@@ -100,6 +134,44 @@ export class Ledger {
     this.run('INSERT INTO users (id,created_at,wallet_tokens) VALUES (?,?,0)', id, now)
     return this.user(id)
   }
+  approval(id) {
+    return this.one('SELECT status FROM chat_access WHERE user=?', id)?.status ?? 'none'
+  }
+  identify(id, profile) {
+    if (!profile) return
+    const name = String(profile.name ?? '').trim().slice(0,128), username = String(profile.username ?? '').trim().slice(0,64)
+    this.run(`INSERT INTO chat_access(user,name,username) VALUES (?,?,?) ON CONFLICT(user)
+      DO UPDATE SET name=excluded.name,username=excluded.username`, id, name, username)
+  }
+  apply(id, note, now) {
+    check(!this.enroll(id, now).blocked, 'This account is suspended.', 403)
+    check(typeof note === 'string' && note.length <= 500, 'Keep the application note within 500 characters.')
+    this.run(`INSERT INTO chat_access(user,status,note,applied_at) VALUES (?,'pending',?,?)
+      ON CONFLICT(user) DO UPDATE SET status='pending',note=excluded.note,applied_at=excluded.applied_at
+      WHERE chat_access.status='none'`, id, note.trim(), now)
+    const status = this.approval(id)
+    return { status, text: applicationMessages[status] }
+  }
+  applications(offset) {
+    integer(offset, 0, 10_000_000, 'application offset')
+    const rows = this.all("SELECT user,name,username,note,applied_at FROM chat_access WHERE status='pending' ORDER BY applied_at,user LIMIT 51 OFFSET ?", offset)
+    return { applications: rows.slice(0,50), more: rows.length > 50 }
+  }
+  reviewAccess(id, status, expected) {
+    check(['approved','declined','revoked'].includes(status), 'Choose a whitelist decision.')
+    const current = this.approval(id)
+    if (current === status) return { status }
+    check(!expected || expected === current, 'Another administrator updated this account. Refresh the list.', 409)
+    this.run('INSERT INTO chat_access(user,status) VALUES (?,?) ON CONFLICT(user) DO UPDATE SET status=excluded.status', id, status)
+    if (status !== 'approved') this.run('UPDATE memberships SET renew=0 WHERE user=? AND renew=1', id)
+    return { status }
+  }
+  checkMember(id, options = this.paymentOptions()) {
+    check(options.mode !== 'closed', accessClosed, 403)
+    check(!this.user(id).blocked, 'This account is suspended. Send /paysupport in private for help.', 403)
+    const status = this.approval(id)
+    check(status === 'approved', applicationMessages[status], 403)
+  }
   // Older, separately purchased passes finish with their original refill calendar.
   legacyPasses(user, now) {
     this.run(`UPDATE subscriptions SET window=CAST((?-starts_at)/? AS INTEGER), remaining=weekly
@@ -111,7 +183,7 @@ export class Ledger {
     this.releaseStale(member.user, now)
     const settings = this.settings(), account = this.user(member.user)
     const next = monthsAfter(member.ends_at, 1, new Date(member.starts_at).getUTCDate())
-    if (!settings.require_payment || !settings.free_weekly_tokens || account.blocked || account.wallet_tokens < member.price || next <= now) {
+    if (this.paymentOptions(settings).mode !== 'paid' || this.approval(member.user) !== 'approved' || !settings.free_weekly_tokens || account.blocked || account.wallet_tokens < member.price || next <= now) {
       this.run('UPDATE memberships SET renew=0 WHERE id=?', member.id)
       return
     }
@@ -150,10 +222,10 @@ export class Ledger {
     check(pending < needed, 'Tokens are reserved for another model call. Please try again shortly.', 429)
     check(false, exhausted, 402)
   }
-  access(user, now) {
-    check(!this.user(user).blocked, 'This account is suspended. Send /paysupport in private for help.', 403)
+  access(user, now, options = this.paymentOptions()) {
+    this.checkMember(user, options)
     this.releaseStale(user, now)
-    if (this.settings().require_payment && this.balance(user, now) <= 0) this.insufficient(user, now, 1)
+    if (options.mode === 'paid' && this.balance(user, now) <= 0) this.insufficient(user, now, 1)
     return { ok: true }
   }
   grantLegacy(id, user, weekly, weeks, now, source) {
@@ -212,10 +284,11 @@ export class Ledger {
   }
   reserve({ user, id, input, output, min_output = 1 }, now) {
     uuid(id)
-    this.access(user, now)
     const settings = this.settings()
+    const options = this.paymentOptions(settings)
+    this.access(user, now, options)
     let held = 0, limit = null, allocation = []
-    if (settings.require_payment) {
+    if (options.mode === 'paid') {
       if (input == null) return { count_required: true }
       integer(input, 0, 100_000_000, 'input token count')
       integer(output, 1, 100_000_000, 'output token limit')
@@ -264,15 +337,15 @@ export class Ledger {
     }
     return { ok: true }
   }
-  purchaseSettings(user, now) {
-    const account = this.enroll(user, now)
-    check(!account.blocked, 'This account is suspended.', 403)
-    const settings = this.settings()
-    check(settings.require_payment, 'The service is currently free. New purchases are paused.', 409)
+  purchaseSettings(user, now, settings = this.settings(), options = this.paymentOptions(settings)) {
+    this.enroll(user, now)
+    this.checkMember(user, options)
+    check(options.mode === 'paid', 'Chat is currently free. New purchases are paused.', 409)
     return settings
   }
-  invoice(user, chain, env, now, usd, rate = null) {
-    const settings = this.purchaseSettings(user, now)
+  invoice(user, chain, now, usd, rate = null) {
+    const settings = this.settings(), options = this.paymentOptions(settings)
+    this.purchaseSettings(user, now, settings, options)
     check(['ETH', 'SOL', 'XTR'].includes(chain), 'Choose a supported currency.')
     const cents = amountCents(usd)
     const tokens = tokensForUsd(cents, settings.input_usd)
@@ -280,9 +353,8 @@ export class Ledger {
     let address = ''
     if (chain === 'XTR') check(stars <= 10_000, 'Choose a smaller dollar amount for a single Stars payment.')
     else {
-      const deposits = this.deposits(env)
-      check(deposits.networks[chain].ready, 'The merchant has not enabled this payment network.', 503)
-      address = deposits[chain.toLowerCase() + '_recipient']
+      check(options.networks[chain].ready, 'The merchant has not enabled this payment network.', 503)
+      address = options[chain.toLowerCase() + '_recipient']
     }
     check(tokens >= 1 && Number.isSafeInteger(this.user(user).wallet_tokens + tokens), 'This top-up exceeds the supported wallet balance.')
     // A reused crypto quote must leave time for the wallet prompt and block inclusion.
@@ -369,7 +441,8 @@ export class Ledger {
     const order = this.order(invoice, user)
     check(order.chain === 'XTR' && currency === 'XTR' && amount === Number(order.amount), 'This invoice does not match the purchase.')
     if (kind === 'precheck') {
-      check(this.settings().require_payment && !this.user(user).blocked && order.expires_at >= now && order.status === 'open'
+      this.purchaseSettings(user, now)
+      check(order.expires_at >= now && order.status === 'open'
         && (!order.precheck || order.precheck === query), 'The invoice is closed. Send /topup for a new one.')
       this.run('UPDATE invoices SET precheck=? WHERE id=?', query, invoice)
       return { ok: true }
@@ -443,22 +516,27 @@ export class Ledger {
     })
     return [...monthly, ...legacy].sort((a,b) => b.starts_at - a.starts_at || b.id.localeCompare(a.id))
   }
-  account(id, now) {
+  account(id, now, options = this.paymentOptions()) {
     this.releaseStale(id, now)
-    const week = this.weekly(id, now), u = this.user(id)
+    const week = this.weekly(id, now), u = this.user(id), approval = this.approval(id)
     const legacy = this.legacyPasses(id, now).reduce((sum,p) => sum + p.remaining, 0)
+    let available = 0
+    if (approval === 'approved' && !u.blocked) {
+      if (options.mode === 'free') available = null
+      if (options.mode === 'paid' && u.wallet_tokens >= 0) available = Math.min(Number.MAX_SAFE_INTEGER, u.wallet_tokens + week.remaining + legacy)
+    }
     return {
-      id, blocked: Boolean(u.blocked), created_at: u.created_at, wallet_tokens: u.wallet_tokens,
+      id, access_mode: options.mode, approval_status: approval, blocked: Boolean(u.blocked), created_at: u.created_at, wallet_tokens: u.wallet_tokens,
       tier: week.member ? 'subscriber' : 'free', allowance_tokens: week.limit, remaining_weekly_tokens: week.remaining,
-      next_refill: week.next, available_tokens: u.wallet_tokens < 0 ? 0 : Math.min(Number.MAX_SAFE_INTEGER, u.wallet_tokens + week.remaining + legacy),
+      next_refill: week.next, available_tokens: available,
       subscriptions: this.subscriptions(id, now, week)
     }
   }
-  payments(id, now, after) {
+  payments(id, now, after, options = this.paymentOptions()) {
     const cursor = after ? this.order(after, id) : null
     const rows = this.all(`${orders} WHERE i.user=? AND (i.created_at,i.id)<(?,?)
       ORDER BY i.created_at DESC,i.id DESC LIMIT 51`, id, cursor?.created_at ?? Number.MAX_SAFE_INTEGER, cursor?.id ?? '')
-    return { invoices: rows.slice(0,50).map(row => this.showOrder(row, now)), invoices_next: rows.length > 50 ? rows[49].id : null }
+    return { invoices: rows.slice(0,50).map(row => this.showOrder(row, now, options)), invoices_next: rows.length > 50 ? rows[49].id : null }
   }
   detail(id, now, after) {
     const page = this.payments(id, now, after)
@@ -469,20 +547,25 @@ export class Ledger {
       adjustments: this.all('SELECT action,reason,tokens,created_at FROM adjustments WHERE user=? ORDER BY created_at DESC LIMIT 50', id)
     }
   }
-  showOrder(row, now) {
+  showOrder(row, now, options = this.paymentOptions()) {
     const { id, chain, amount, recipient, reference, weekly, weeks, created_at, expires_at, status } = row
+    const current = options[chain.toLowerCase() + '_recipient']
+    const receiving = options.chains.includes(chain) && (chain === 'ETH' ? recipient.toLowerCase() === current.toLowerCase() : recipient === current)
     return { id, chain, amount, recipient, reference, weekly_tokens: weekly, weeks, created_at, expires_at,
+      accepts_payment: options.mode === 'paid' && (chain === 'XTR' || receiving),
       product: row.tokens == null ? 'legacy_plan' : 'tokens', usd: row.usd_cents == null ? null : dollars(row.usd_cents),
       tokens: row.tokens, rate_usd: row.rate,
       tx: row.tx ?? row.submitted_tx ?? null, note: row.claim_error ?? null,
       status: row.next_check != null ? 'confirming' : status === 'open' && expires_at < now ? 'expired' : status }
   }
-  users(q, offset) {
+  users(q, offset, approval = '') {
     check(typeof q === 'string' && /^\d{0,16}$/.test(q), 'Search by Telegram user ID.')
     integer(offset, 0, 10_000_000, 'page offset')
-    const rows = this.all('SELECT * FROM users WHERE id LIKE ? ORDER BY created_at DESC,id LIMIT 51 OFFSET ?', q + '%', offset)
+    check(approval === '' || approval === 'approved', 'Choose a valid account filter.')
+    const rows = this.all(`SELECT u.*,coalesce(a.status,'none') AS approval_status FROM users u LEFT JOIN chat_access a ON a.user=u.id
+      WHERE u.id LIKE ? AND (?='' OR a.status=?) ORDER BY u.created_at DESC,u.id LIMIT 51 OFFSET ?`, q + '%', approval, approval, offset)
     return { more: rows.length > 50, users: rows.slice(0,50).map(row => ({
-      id: row.id, created_at: row.created_at, blocked: Boolean(row.blocked), wallet_tokens: row.wallet_tokens
+      id: row.id, created_at: row.created_at, blocked: Boolean(row.blocked), approval_status: row.approval_status, wallet_tokens: row.wallet_tokens
     })) }
   }
   overview(now) {
