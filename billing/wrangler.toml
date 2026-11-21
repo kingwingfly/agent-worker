@@ -1,0 +1,40 @@
+name = "agent-worker-billing"
+main = "src/worker.js"
+compatibility_date = "2026-10-01"
+workers_dev = true
+preview_urls = false
+
+# Local Wrangler requests simulate a successful Access sign-in.
+[access.dev]
+aud = "local-billing-admin"
+
+[[rules]]
+type = "Text"
+globs = ["**/public/assets/*.js", "**/public/assets/*.css", "**/public/assets/*.txt"]
+fallthrough = true
+
+[[rules]]
+type = "Data"
+globs = ["**/public/assets/*.webp", "**/public/assets/*.woff2"]
+fallthrough = true
+
+# Admin → Deposit addresses works without a [vars] section. To supply deployment
+# defaults, uncomment [vars] and the address for each network you want to accept.
+# Set the corresponding ETH_RPC_URL or SOL_RPC_URL separately as a Worker secret.
+# Chat starts closed. Open access in Plan settings and approve accounts in Users.
+# [vars]
+# ETH_RECIPIENT = "your-public-ethereum-address"
+# SOL_RECIPIENT = "your-public-solana-address"
+
+[[durable_objects.bindings]]
+name = "LEDGER"
+class_name = "BillingLedger"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["BillingLedger"]
+
+# Use the gateway's existing bucket for authenticated access to generated files.
+[[r2_buckets]]
+binding = "STATE"
+bucket_name = "agent-worker-state"

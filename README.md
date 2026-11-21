@@ -26,6 +26,10 @@ Telegram ──webhook──▶ Worker
 | `containers/mcp` | MCP image: `mcp-front` and the placeholder; point it at your server |
 | `skills/` | Skills baked into the agent image |
 
+## Optional paid service
+
+With the optional billing Worker enabled, chat starts closed. Users send `/apply` in Telegram or apply from the signed-in checkout. Admins review applications, manage the whitelist and explicitly open paid or free chat. Paid accounts buy tokens by dollar amount through ETH, SOL or Telegram Stars, then spend them on chat or a monthly subscription with five times the free weekly allowance. The Cloudflare Access-protected dashboard manages prices, optional deposit addresses, quotas, subscriptions, chat history and output files. The gateway ships with `BILLING_ENABLED = "false"`. [Access setup and payment guide](billing/README.md)
+
 ## How a message is handled
 
 1. Telegram calls `/tg/webhook`. The Worker checks the webhook secret and the user allow-list and hands the update to the chat's `SessionDO`.
@@ -287,6 +291,7 @@ To try a change without building the image, install Chromium or Chrome and Pytho
 | `APPROVAL_TIMEOUT_SECS` | 600 | Unanswered prompts are denied after this |
 | `TURN_TIMEOUT_SECS` | 1800 | A turn is interrupted after this |
 | `DAILY_TOKEN_BUDGET` | 0 (off) | Fresh tokens per session per UTC day, counted at the `/llm` proxy from what each model call reports. Checked when a message arrives and before every model call, so a turn that uses it up ends there. A session is a chat, or one person's summons of the bot as a guest in one chat, so someone who summons it in several chats has this much in each |
+| `BILLING_ENABLED` | false | Enable the optional billing Worker through the `BILLING` service binding |
 | `MCP_IDLE_TTL_SECS` | 900 | Idle time before the MCP container stops |
 | `MCP_CONTAINER_ENV` | none | Comma separated names of secrets or variables the MCP container is started with (see "Your MCP server") |
 

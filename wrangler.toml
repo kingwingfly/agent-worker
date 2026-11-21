@@ -53,6 +53,8 @@ TURN_TIMEOUT_SECS = "1800"
 # or one user's summons of the bot as a guest in one chat.
 DAILY_TOKEN_BUDGET = "0"
 MCP_IDLE_TTL_SECS = "900"
+# Enable only after deploying billing/wrangler.toml and binding GatewayBilling below.
+BILLING_ENABLED = "false"
 # Names of secrets (or variables) the MCP container is started with, comma separated:
 # the MCP server's credentials, which must not be in its image.
 MCP_CONTAINER_ENV = ""
@@ -91,3 +93,9 @@ max_instances = 1
 [[r2_buckets]]
 binding = "STATE"
 bucket_name = "agent-worker-state"
+
+# Optional paid service. See billing/README.md before enabling BILLING_ENABLED.
+# [[services]]
+# binding = "BILLING"
+# service = "agent-worker-billing"
+# entrypoint = "GatewayBilling"

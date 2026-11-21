@@ -19,6 +19,7 @@ use worker::{
 };
 
 use crate::{
+    billing::{self, model::Reservation},
     calls::{self, Admission, Refusal},
     config::{Config, LlmAuth},
     mcp_host::{MCP_BINDING, MCP_INSTANCE},
@@ -50,7 +51,7 @@ const OVER_BUDGET: &str = "Today's usage limit for this chat is used up.";
 
 /// A refusal of this Worker's own, in the shape of an Anthropic API error, which Claude
 /// Code reports cleanly.
-fn refused(status: u16, kind: &str, message: &str) -> Result<Response> {
+pub(crate) fn refused(status: u16, kind: &str, message: &str) -> Result<Response> {
     let body = json!({ "type": "error", "error": { "type": kind, "message": message } });
     Ok(Response::from_json(&body)?.with_status(status))
 }
@@ -69,7 +70,7 @@ fn unauthorized() -> Result<Response> {
 ///
 /// A session that cannot be asked is an error, not a yes: the caller answers with a
 /// failure that Claude Code tries again.
-async fn turned_away(env: &Env, claims: &Claims, spends: bool) -> Result<Option<Response>> {
+async fn admit(env: &Env, claims: &Claims, spends: bool) -> Result<Response> {
     let asked = Admission {
         expires_at: claims.expires_at,
         spends,
@@ -85,9 +86,12 @@ async fn turned_away(env: &Env, claims: &Claims, spends: bool) -> Result<Option<
         .await?;
     let status = answer.status_code();
     match Refusal::from_status(status) {
-        Some(Refusal::Stale) => unauthorized().map(Some),
-        Some(Refusal::OverBudget) => refused(402, "billing_error", OVER_BUDGET).map(Some),
-        None if status == 200 => Ok(None),
+        Some(Refusal::Stale) => unauthorized(),
+        Some(Refusal::OverBudget) => refused(402, "billing_error", OVER_BUDGET),
+        None if status == 403 => {
+            refused(403, "permission_error", "A billable turn must be active.")
+        }
+        None if status == 200 => Ok(answer),
         None => Err(error(format!(
             "the session answered {status} when asked about a token"
         ))),
@@ -97,7 +101,7 @@ async fn turned_away(env: &Env, claims: &Claims, spends: bool) -> Result<Option<
 /// Copies the request headers minus credentials and everything describing the hop from
 /// the container to this Worker.
 fn forwarded_headers(request: &Request) -> Result<Headers> {
-    const DROPPED: [&str; 8] = [
+    const DROPPED: [&str; 9] = [
         "authorization",
         "x-api-key",
         "host",
@@ -106,6 +110,7 @@ fn forwarded_headers(request: &Request) -> Result<Headers> {
         "cdn-loop",
         "x-real-ip",
         SESSION_HEADER,
+        billing::PAYER_HEADER,
     ];
     let headers = Headers::new();
     for (name, value) in request.headers().entries() {
@@ -119,7 +124,12 @@ fn forwarded_headers(request: &Request) -> Result<Headers> {
 }
 
 /// A request for `target` with a body that has been read already.
-fn rebuilt(method: Method, target: &str, headers: Headers, body: &[u8]) -> Result<Request> {
+pub(crate) fn rebuilt(
+    method: Method,
+    target: &str,
+    headers: Headers,
+    body: &[u8],
+) -> Result<Request> {
     let mut init = RequestInit::new();
     init.with_method(method).with_headers(headers);
     if !body.is_empty() {
@@ -146,7 +156,7 @@ fn excerpt(said: &[u8]) -> String {
 }
 
 /// The headers of the gateway's response that are passed on.
-fn kept_headers(response: &Response) -> Result<Headers> {
+pub(crate) fn kept_headers(response: &Response) -> Result<Headers> {
     let headers = Headers::new();
     for name in scrub::KEPT_HEADERS {
         if let Some(value) = response.headers().get(name)? {
@@ -158,7 +168,7 @@ fn kept_headers(response: &Response) -> Result<Headers> {
 
 /// The answer to a model call that failed, in place of the gateway's own: what kind of
 /// failure it was, and nothing about where it happened.
-fn failure(status: u16, said: &[u8], headers: Headers) -> Result<Response> {
+pub(crate) fn failure(status: u16, said: &[u8], headers: Headers) -> Result<Response> {
     headers.set("content-type", "application/json")?;
     let body = scrub::error_body(Some(status), said);
     Ok(Response::from_json(&body)?
@@ -213,10 +223,21 @@ pub async fn llm(request: Request, env: &Env, ctx: &Context, cfg: &Config) -> Re
     };
     let session = &claims.session;
     let answered = async {
-        match turned_away(env, &claims, true).await? {
-            Some(refusal) => Ok(refusal),
-            None => forward(request, env, ctx, cfg, session).await,
+        let admission = admit(env, &claims, true).await?;
+        if admission.status_code() != 200 {
+            return Ok(admission);
         }
+        let payer = if cfg.billing_enabled {
+            Some(
+                admission
+                    .headers()
+                    .get(billing::PAYER_HEADER)?
+                    .ok_or_else(|| error("missing payer"))?,
+            )
+        } else {
+            None
+        };
+        forward(request, env, ctx, cfg, session, payer.as_deref()).await
     };
     answered.await.or_else(|error| {
         // Not returned as it is: the runtime's own errors can quote the address that
@@ -232,6 +253,7 @@ async fn forward(
     ctx: &Context,
     cfg: &Config,
     session: &str,
+    payer: Option<&str>,
 ) -> Result<Response> {
     let url = request.url()?;
     let path = url.path().strip_prefix("/llm").unwrap_or_default();
@@ -242,7 +264,7 @@ async fn forward(
         console_error!("{session}: refused {method} {path}, which is not a model call");
         return refused(404, "not_found_error", "There is nothing at this address.");
     }
-    let body = request.bytes().await?;
+    let mut body = request.bytes().await?;
     if !calls::names_a_configured_model(&body, cfg.model.as_deref(), cfg.small_model.as_deref()) {
         let named = calls::named_model(&body).unwrap_or_default();
         let named = excerpt(named.as_bytes());
@@ -262,12 +284,36 @@ async fn forward(
         LlmAuth::Bearer => headers.set("authorization", &format!("Bearer {}", cfg.llm_api_key))?,
         LlmAuth::ApiKey => headers.set("x-api-key", &cfg.llm_api_key)?,
     }
-    let mut response = Fetch::Request(rebuilt(method, &target, headers, &body)?)
-        .send()
-        .await?;
+    let reservation = if let Some(user) = payer {
+        let count_target = format!("{}/v1/messages/count_tokens{query}", cfg.llm_base_url);
+        match billing::model::prepare(env, user, path, &count_target, &headers, &mut body).await? {
+            billing::model::Admission::Ready(reservation) => reservation,
+            billing::model::Admission::Refused(response) => return Ok(response),
+        }
+    } else {
+        None
+    };
+    let upstream = async {
+        Fetch::Request(rebuilt(method, &target, headers, &body)?)
+            .send()
+            .await
+    }
+    .await;
+    let mut response = match upstream {
+        Ok(response) => response,
+        Err(cause) => {
+            if let Some(hold) = reservation {
+                ctx.wait_until(hold.finish(None));
+            }
+            return Err(cause);
+        }
+    };
     let status = response.status_code();
     let headers = kept_headers(&response)?;
     if !(200..300).contains(&status) {
+        if let Some(hold) = reservation {
+            ctx.wait_until(hold.finish(None));
+        }
         let said = response.bytes().await.unwrap_or_default();
         let logged = excerpt(&said);
         console_error!("{session}: the gateway answered {status}: {logged}");
@@ -279,15 +325,13 @@ async fn forward(
     let stub = env
         .durable_object(SESSION_BINDING)
         .and_then(|namespace| namespace.get_by_name(session));
-    match (response.cloned(), stub) {
-        (Ok(copy), Ok(stub)) => ctx.wait_until(async move {
-            if let Err(error) = meter(copy, stub).await {
+    match response.cloned() {
+        Ok(copy) => ctx.wait_until(async move {
+            if let Err(error) = meter(copy, stub, reservation).await {
                 console_error!("metering a model call failed: {error}");
             }
         }),
-        (Err(error), _) | (_, Err(error)) => {
-            console_error!("a model call could not be metered: {error}");
-        }
+        Err(error) => console_error!("a model call could not be metered: {error}"),
     }
 
     let streamed = headers
@@ -311,23 +355,31 @@ async fn forward(
 }
 
 /// Reads a copy of a model response to its end and reports the tokens to the session.
-async fn meter(mut copy: Response, session: Stub) -> Result<()> {
+async fn meter(
+    mut copy: Response,
+    session: Result<Stub>,
+    reservation: Option<Reservation>,
+) -> Result<()> {
     let streamed = copy
         .headers()
         .get("content-type")?
         .is_some_and(|kind| kind.starts_with("text/event-stream"));
-    let usage: Usage = if streamed {
+    let usage = if streamed {
         let mut scanner = SseUsage::default();
         let mut body = copy.stream()?;
         // A stream that breaks off still counts for what it had reported by then.
         while let Some(Ok(chunk)) = body.next().await {
             scanner.feed(&chunk);
         }
-        scanner.usage()
+        scanner.finish()
     } else {
-        json_usage(&copy.bytes().await?)
+        let body = copy.bytes().await?;
+        (reservation.is_none() || scrub::is_answer(&body)).then(|| json_usage(&body))
     };
-    let tokens = usage.billable();
+    if let Some(hold) = reservation {
+        hold.finish(usage).await;
+    }
+    let tokens = usage.as_ref().map_or(0, Usage::billable);
     if tokens == 0 {
         return Ok(());
     }
@@ -338,7 +390,7 @@ async fn meter(mut copy: Response, session: Stub) -> Result<()> {
             &json!({ "tokens": tokens }).to_string(),
         )));
     let report = Request::new_with_init(&format!("https://session{USAGE_PATH}"), &init)?;
-    session.fetch_with_request(report).await.map(drop)
+    session?.fetch_with_request(report).await.map(drop)
 }
 
 /// `ANY /mcp[/...]` and `/file` → the shared MCP container, by way of its Durable Object.
@@ -349,8 +401,22 @@ pub async fn mcp(request: Request, env: &Env, cfg: &Config) -> Result<Response> 
     };
     // The MCP server acts in the chat's name, which a token that has left its container
     // must not be able to borrow.
-    if let Some(refusal) = turned_away(env, &claims, false).await? {
-        return Ok(refusal);
+    let admission = admit(env, &claims, false).await?;
+    if admission.status_code() != 200 {
+        return Ok(admission);
+    }
+    if cfg.billing_enabled {
+        let user = admission
+            .headers()
+            .get(billing::PAYER_HEADER)?
+            .ok_or_else(|| error("missing payer"))?;
+        if !billing::member_allowed(env, &user).await? {
+            return refused(
+                403,
+                "permission_error",
+                "Chat access is closed or this account has no access.",
+            );
+        }
     }
     let url = request.url()?;
     let query = url
