@@ -1,0 +1,38 @@
+name = "agent-worker-billing"
+main = "src/worker.js"
+compatibility_date = "2026-10-01"
+workers_dev = true
+preview_urls = false
+
+# Local Wrangler requests simulate a successful Access sign-in.
+[access.dev]
+aud = "local-billing-admin"
+
+[[rules]]
+type = "Text"
+globs = ["**/public/assets/*.js", "**/public/assets/*.css", "**/public/assets/*.txt"]
+fallthrough = true
+
+[[rules]]
+type = "Data"
+globs = ["**/public/assets/*.webp", "**/public/assets/*.woff2"]
+fallthrough = true
+
+# Set receiving addresses in the dashboard. These optional deployment defaults apply
+# until an operator saves Deposit addresses. Set the RPC endpoints as Worker secrets.
+[vars]
+ETH_RECIPIENT = ""
+SOL_RECIPIENT = ""
+
+[[durable_objects.bindings]]
+name = "LEDGER"
+class_name = "BillingLedger"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["BillingLedger"]
+
+# Use the gateway's existing bucket for authenticated access to generated files.
+[[r2_buckets]]
+binding = "STATE"
+bucket_name = "agent-worker-state"

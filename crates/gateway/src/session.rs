@@ -30,6 +30,7 @@ use worker::{
 };
 
 use crate::{
+    billing,
     bot::Bot,
     calls::{self, Admission, Refusal, Standing},
     config::Config,
@@ -253,6 +254,9 @@ struct Session {
     control_secret: String,
     /// Unix seconds at which the current container's session token expires.
     token_expires_at: u64,
+    /// Account authorized to spend with the current container token in a paid deployment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    token_payer: Option<i64>,
     /// A state archive for the conversation exists in R2.
     has_state: bool,
     /// The checkpoint that archive is: what the conversation was last saved as, and what
@@ -280,6 +284,16 @@ struct Session {
     unsent: Vec<Unsent>,
 }
 
+impl Session {
+    fn payer(&self) -> Option<i64> {
+        self.turn
+            .as_ref()?
+            .payer
+            .or(self.guest)
+            .or_else(|| self.private.then_some(self.chat_id))
+    }
+}
+
 /// The last form of a guest's reply, on its way to Telegram.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Unsent {
@@ -297,6 +311,9 @@ struct Unsent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Turn {
     id: String,
+    /// Telegram user who initiated this turn, including in a shared group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    payer: Option<i64>,
     text: String,
     started_at_ms: u64,
     /// The message that shows the turn's progress. It is edited as the turn goes on and
@@ -440,8 +457,22 @@ impl DurableObject for SessionDO {
         }
         if request.path() == ADMIT_PATH {
             let asked: Admission = request.json().await?;
-            return match self.inner.refusal(asked)? {
+            let cfg = self.inner.cfg()?;
+            return match self.inner.refusal(asked, &cfg)? {
                 Some(refusal) => Response::error("refused", refusal.status()),
+                None if asked.spends && cfg.billing_enabled => {
+                    let session = self.inner.session.borrow();
+                    let Some(user) = session.payer().filter(|payer| {
+                        cfg.dev_runner_url.is_some() || session.token_payer == Some(*payer)
+                    }) else {
+                        return Response::error("no active payer", 403);
+                    };
+                    let mut response = Response::empty()?;
+                    response
+                        .headers_mut()
+                        .set(billing::PAYER_HEADER, &user.to_string())?;
+                    Ok(response)
+                }
                 None => Response::empty(),
             };
         }
@@ -497,8 +528,7 @@ impl Inner {
     /// Why a request that came with a valid session token is turned away, if it is: the
     /// token belongs to a container that is no longer this chat's, or it is a model call
     /// and today's tokens are used up.
-    fn refusal(&self, asked: Admission) -> Result<Option<Refusal>> {
-        let cfg = self.cfg()?;
+    fn refusal(&self, asked: Admission, cfg: &Config) -> Result<Option<Refusal>> {
         let host = self.host()?;
         let standing = Standing {
             // A runner started by hand was given no token by this object.
@@ -680,7 +710,10 @@ impl Inner {
             match message.text.as_deref().map(str::trim) {
                 Some(text) if !text.is_empty() => match command(text) {
                     Some(command) => self.on_command(&cfg, &bot, &to, command, text).await,
-                    None => self.begin_turn(&cfg, &bot, &to, text).await,
+                    None => {
+                        self.begin_turn(&cfg, &bot, &to, text, message.from.as_ref().map(|u| u.id))
+                            .await
+                    }
                 },
                 _ => bot
                     .send_message(message.chat.id, "I can only read text messages.", None)
@@ -736,7 +769,8 @@ impl Inner {
             return self.reply(bot, &to, GUEST_HELP, None).await.map(drop);
         }
         let request = render::guest_request(text, replied);
-        self.begin_turn(cfg, bot, &to, &request).await
+        self.begin_turn(cfg, bot, &to, &request, Some(caller.id))
+            .await
     }
 
     async fn on_command(
@@ -750,6 +784,7 @@ impl Inner {
         let guest = self.is_guest();
         let help = if guest { GUEST_HELP } else { HELP };
         let (reply, keyboard) = match command {
+            "/start" | "/help" if cfg.billing_enabled => (format!("{help}{}", billing::HELP), None),
             "/start" | "/help" => (help.to_owned(), None),
             "/new" => (self.reset().await?, None),
             "/resume" => self.offer_resume()?,
@@ -773,6 +808,7 @@ impl Inner {
         bot: &Bot,
         to: &Reply<'_>,
         text: &str,
+        payer: Option<i64>,
     ) -> Result<()> {
         let refusal = if self.turn().is_some() {
             Some("I'm still working on your previous message. Send /stop to cancel it.")
@@ -792,6 +828,7 @@ impl Inner {
         self.update(|session| {
             session.turn = Some(Turn {
                 id: random_uuid(),
+                payer: payer.filter(|_| cfg.billing_enabled),
                 text: text.to_owned(),
                 started_at_ms: now_ms(),
                 status_message_id: None,
@@ -1253,10 +1290,20 @@ impl Inner {
         }
         let cfg = self.cfg()?;
         let host = self.host()?;
-        if let Host::Container(container) = &host
-            && !container.running()
-        {
-            self.start_container(&cfg, container)?;
+        if let Host::Container(container) = &host {
+            // A shared chat keeps its conversation when another member starts a turn.
+            // Only a fresh runner and token may spend for the new payer.
+            let changed_payer = cfg.billing_enabled && {
+                let session = self.session.borrow();
+                session.token_payer != session.payer()
+            };
+            if container.running() && changed_payer {
+                self.live.borrow_mut().socket = None;
+                host.stop().await?;
+            }
+            if !container.running() {
+                self.start_container(&cfg, container)?;
+            }
         }
         if self.live.borrow().socket.is_none() {
             self.establish(&cfg, &host).await?;
@@ -1311,7 +1358,10 @@ impl Inner {
             let session = self.session.borrow();
             (session.name.clone(), session.claude_session_id.clone())
         };
-        let expires_at = now_ms() / 1000 + TOKEN_TTL_SECS;
+        let mut expires_at = now_ms() / 1000 + TOKEN_TTL_SECS;
+        if cfg.billing_enabled {
+            expires_at = expires_at.max(self.session.borrow().token_expires_at + 1);
+        }
         let claims = Claims {
             session: name,
             expires_at,
@@ -1335,6 +1385,7 @@ impl Inner {
         self.update(|session| {
             session.control_secret = secret;
             session.token_expires_at = expires_at;
+            session.token_payer = session.payer().filter(|_| cfg.billing_enabled);
             session.needs_restore = session.has_state;
             // A new runner counts its frames from one again.
             session.last_seq = 0;
@@ -2217,6 +2268,24 @@ impl Inner {
         let idle_ttl_ms = match self.cfg() {
             Ok(cfg) => {
                 self.report_turn(&cfg, &turn, &result).await;
+                if cfg.billing_enabled
+                    && let Some(user) = turn.payer
+                {
+                    let name = self.session.borrow().name.clone();
+                    if let Err(cause) = billing::record(
+                        &self.env,
+                        user,
+                        &turn.id,
+                        &name,
+                        &turn.text,
+                        turn.started_at_ms,
+                        &result,
+                    )
+                    .await
+                    {
+                        console_error!("recording turn history failed: {cause}");
+                    }
+                }
                 cfg.idle_ttl_ms
             }
             Err(error) => {

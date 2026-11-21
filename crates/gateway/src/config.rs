@@ -59,6 +59,7 @@ pub struct Config {
     pub model: Option<String>,
     pub small_model: Option<String>,
     pub allowed_users: AllowedUsers,
+    pub billing_enabled: bool,
     /// How long an agent container stays warm after a turn.
     pub idle_ttl_ms: u64,
     pub approval_timeout_ms: u64,
@@ -167,6 +168,11 @@ impl Config {
             model: var(env, "MODEL"),
             small_model: var(env, "SMALL_MODEL"),
             allowed_users: AllowedUsers::parse(var(env, "ALLOWED_TG_USERS").as_deref()),
+            billing_enabled: match var(env, "BILLING_ENABLED").as_deref() {
+                None | Some("false") => false,
+                Some("true") => true,
+                _ => return Err(error("BILLING_ENABLED must be true or false")),
+            },
             idle_ttl_ms: seconds(env, "IDLE_TTL_SECS", 120)?,
             approval_timeout_ms: seconds(env, "APPROVAL_TIMEOUT_SECS", 600)?,
             turn_timeout_ms: seconds(env, "TURN_TIMEOUT_SECS", 1800)?,

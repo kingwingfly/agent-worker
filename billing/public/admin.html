@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Billing console · agent-worker</title>
+  <link rel="stylesheet" href="/assets/style.css">
+  <script type="module" src="/assets/admin.js"></script>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+  <header class="bar">
+    <div class="bar-inner">
+      <a class="brand" href="#overview" aria-label="agent-worker billing overview"><span class="mark" aria-hidden="true">a</span>agent-worker</a>
+      <div class="bar-tools"><img class="console-mascot" src="/assets/wallet-cat.webp" width="446" height="526" alt=""><span class="bar-label">Billing console</span></div>
+    </div>
+  </header>
+  <nav class="tabs" aria-label="Billing console"><div class="wrap">
+    <a href="#overview" aria-current="page">Overview</a><a href="#users">Users</a><a href="#settings">Plan settings</a><a href="#deposits">Deposit addresses</a>
+  </div></nav>
+  <main class="wrap" id="main" tabindex="-1">
+    <noscript><p class="notice">Enable JavaScript to use the billing console.</p></noscript>
+    <p class="notice" id="notice" role="status" aria-live="polite" hidden></p>
+
+    <section id="overview">
+      <div class="page-heading"><div><h1>Overview</h1></div><button class="secondary" type="button" id="refresh">Refresh</button></div>
+      <dl class="metrics overview-metrics">
+        <div><dt>Token sales (USD)</dt><dd id="sales-total">—</dd></div>
+        <div><dt>Registered users</dt><dd id="user-count">—</dd></div>
+        <div><dt>Active subscriptions</dt><dd id="subscription-count">—</dd></div>
+        <div><dt>Billable tokens</dt><dd id="token-total">—</dd></div>
+        <div><dt>Estimated model cost</dt><dd id="cost-total">—</dd></div>
+      </dl>
+      <div class="panel">
+        <div class="section-heading"><h2>Payments received</h2><a href="#deposits">Manage deposit addresses</a></div>
+        <p class="muted" id="payment-count"></p>
+        <dl class="rows" id="revenues"></dl>
+      </div>
+    </section>
+
+    <section id="users" hidden>
+      <div class="page-heading"><div><h1>Users</h1></div></div>
+      <details class="panel"><summary>Add a user</summary>
+        <form id="add-user" class="search">
+          <label>Telegram user ID <input name="id" required inputmode="numeric" pattern="[1-9][0-9]{0,15}" maxlength="16" autocomplete="off"></label>
+          <button>Add user</button>
+        </form>
+      </details>
+      <div class="panel">
+        <form id="user-search" class="search">
+          <label>Telegram user ID <input type="search" name="q" maxlength="16" pattern="[0-9]*" inputmode="numeric" autocomplete="off" placeholder="Search users"></label>
+          <button class="secondary">Search</button>
+        </form>
+        <div id="user-list"></div>
+        <button type="button" id="more-users" class="secondary" hidden>Load more users</button>
+      </div>
+    </section>
+
+    <section id="account" hidden>
+      <div class="page-heading"><div><a class="crumb" href="#users">All users</a><h1 id="account-title">User account</h1></div><span id="account-state"></span></div>
+      <div id="account-body" hidden>
+        <dl class="metrics overview-metrics">
+          <div><dt>Available tokens</dt><dd id="available"></dd></div>
+          <div><dt>Wallet tokens</dt><dd id="wallet-tokens"></dd></div>
+          <div><dt>Weekly tokens left</dt><dd id="weekly-left"></dd></div>
+          <div><dt>Billable tokens</dt><dd id="account-tokens"></dd></div>
+          <div><dt>Estimated model cost</dt><dd id="account-cost"></dd></div>
+        </dl>
+        <p class="section-intro" id="user-allowance"></p>
+        <section class="panel"><div class="section-heading"><h2>Chat history &amp; files</h2><button type="button" id="open-history" class="secondary">Refresh history</button></div>
+          <div id="history"></div><button type="button" id="more-history" class="secondary" hidden>Load older turns</button>
+        </section>
+        <section class="panel">
+          <h2>Private chat storage</h2>
+          <p class="hint">Browse this user's private chat saves, including files created before billing was enabled.</p>
+          <div class="private-storage">
+            <div><h3>Private chat archives</h3><p class="hint">Each checkpoint contains the conversation transcript and workspace.</p><div id="private-archives"></div></div>
+            <div><h3>Private output files</h3><p class="hint">Files produced by the agent in this private chat.</p><div id="private-files"></div></div>
+          </div>
+        </section>
+        <section class="panel">
+          <div class="section-heading"><h2>Account access</h2><span class="muted" id="joined"></span></div>
+          <button type="button" id="toggle-user" class="secondary"></button>
+        </section>
+        <section class="panel"><h2>Memberships</h2><div id="subscriptions"></div></section>
+        <div class="pair">
+          <form class="panel stack" id="airdrop">
+            <h2>Airdrop tokens</h2>
+            <label>Wallet tokens <input required type="number" name="tokens" min="1" max="1000000000000" step="1"></label>
+            <label>Reason <input required name="reason" maxlength="500"></label>
+            <button>Grant tokens</button>
+          </form>
+          <form class="panel stack" id="grant">
+            <h2>Grant membership</h2>
+            <label>Months <input required type="number" name="months" min="1" max="12" step="1" value="1"></label>
+            <label>Reason <input required name="reason" maxlength="500"></label>
+            <p class="hint">Grants the subscriber allowance for a fixed term. Renewal is off.</p>
+            <button>Grant membership</button>
+          </form>
+        </div>
+        <section class="panel"><h2>Payment history</h2><div id="payments"></div></section>
+        <section class="panel"><h2>Account adjustments</h2><div id="adjustments"></div></section>
+        <details class="panel cleanup"><summary>Data cleanup</summary>
+          <p>Permanently delete billing-recorded chat turns and their generated output files from before the selected UTC time.</p>
+          <form class="stack" id="cleanup">
+            <div class="fields"><label>Before (UTC) <input required type="datetime-local" step="1" name="date"></label><label>Confirm Telegram user ID <input required name="confirm" inputmode="numeric" autocomplete="off"></label></div>
+            <button class="danger">Delete history and files</button>
+          </form>
+        </details>
+      </div>
+    </section>
+
+    <section id="settings" hidden>
+      <div class="page-heading"><div><h1>Plan settings</h1></div></div>
+      <form id="plan" class="stack">
+        <fieldset id="plan-fields" disabled>
+          <section class="panel stack">
+            <h2>Usage pricing</h2>
+            <label class="check"><input name="require_payment" type="checkbox"><span>Charge for usage after the weekly allowance</span></label>
+            <div class="fields">
+              <label>USD per million input tokens <input required type="number" inputmode="decimal" min="0.01" max="10000" step="0.000001" name="input_usd"></label>
+              <label>USD per million output tokens <input required type="number" inputmode="decimal" min="0.01" max="10000" step="0.000001" name="output_usd"></label>
+            </div>
+            <label>Telegram Stars per US dollar <input required type="number" min="1" max="10000" step="1" name="stars_per_usd"></label>
+            <p class="hint" id="saved-example"></p>
+          </section>
+          <section class="panel stack">
+            <h2>Weekly allowance &amp; membership</h2>
+            <div class="fields">
+              <label>Free tokens per week <input required type="number" min="0" max="1000000000000" step="1" name="free_weekly_tokens"></label>
+              <label>Monthly price (USD) <input required type="number" inputmode="decimal" min="0.01" max="10000" step="0.01" name="monthly_usd"></label>
+            </div>
+            <p class="summary-line" id="saved-price"></p>
+          </section>
+          <details class="panel">
+            <summary>Provider cost estimates</summary>
+            <p class="hint">Your costs in USD per million tokens.</p>
+            <div class="fields">
+              <label>Input <input required type="number" min="0" step="any" max="1000000" name="input_cost"></label>
+              <label>Output <input required type="number" min="0" step="any" max="1000000" name="output_cost"></label>
+              <label>Cache writes <input required type="number" min="0" step="any" max="1000000" name="cache_write_cost"></label>
+              <label>Cache reads <input required type="number" min="0" step="any" max="1000000" name="cache_read_cost"></label>
+            </div>
+          </details>
+          <section class="panel stack"><h2>Payment support</h2><label>Contact shown to users <input required name="support" maxlength="500"></label></section>
+          <button>Save settings</button>
+        </fieldset>
+      </form>
+    </section>
+
+    <section id="deposits" hidden>
+      <div class="page-heading"><div><h1>Deposit addresses</h1></div></div>
+      <form id="deposit-form">
+        <fieldset id="deposit-fields" disabled>
+          <p class="section-intro">New payment quotes use these receiving addresses. Each issued invoice keeps its original destination.</p>
+          <section class="panel stack">
+            <div class="section-heading"><h2>Ethereum mainnet</h2><span id="eth-status"></span></div>
+            <label>ETH receiving address <input type="text" name="eth_recipient" spellcheck="false" autocapitalize="none" autocomplete="off" placeholder="0x…" pattern="0x[0-9a-fA-F]{40}"></label>
+            <div id="eth-setup"></div>
+          </section>
+          <section class="panel stack">
+            <div class="section-heading"><h2>Solana mainnet</h2><span id="sol-status"></span></div>
+            <label>SOL receiving address <input type="text" name="sol_recipient" spellcheck="false" autocapitalize="none" autocomplete="off" placeholder="Base58 address" pattern="[1-9A-HJ-NP-Za-km-z]{32,44}"></label>
+            <div id="sol-setup"></div>
+          </section>
+          <button>Save deposit addresses</button>
+        </fieldset>
+      </form>
+    </section>
+  </main>
+</body>
+</html>

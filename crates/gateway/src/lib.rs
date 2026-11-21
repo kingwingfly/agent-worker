@@ -15,6 +15,7 @@ pub mod render;
 pub mod scrub;
 pub mod update;
 
+mod billing;
 mod bot;
 mod config;
 mod container_ext;
@@ -68,7 +69,7 @@ fn under(path: &str, prefix: &str) -> bool {
         .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
-async fn telegram(request: Request, env: &Env, cfg: &Config) -> Result<Response> {
+async fn telegram(mut request: Request, env: &Env, cfg: &Config) -> Result<Response> {
     let presented = request
         .headers()
         .get("x-telegram-bot-api-secret-token")?
@@ -76,18 +77,27 @@ async fn telegram(request: Request, env: &Env, cfg: &Config) -> Result<Response>
     if !constant_time_eq(&presented, &cfg.webhook_secret) {
         return Response::error("forbidden", 403);
     }
-    // From here on Telegram always gets a 200: anything else makes it send the update
-    // again. So nothing that goes wrong with the update is this request's error.
-    if let Err(error) = take_update(request, env, cfg).await {
+    let body = request.text().await?;
+    if cfg.billing_enabled {
+        match billing::payment_update(env, cfg, &body).await {
+            Ok(true) => return Response::empty(),
+            Ok(false) => {}
+            Err(cause) => {
+                console_error!("payment update needs redelivery: {cause}");
+                return Response::error("payment service unavailable", 503);
+            }
+        }
+    }
+    // Ordinary updates are acknowledged even when the session cannot handle them.
+    if let Err(error) = take_update(&body, env, cfg).await {
         console_error!("an update could not be handled: {error}");
     }
     Response::empty()
 }
 
 /// Hands an update to the session it is for, if it is for one and its user is let in.
-async fn take_update(mut request: Request, env: &Env, cfg: &Config) -> Result<()> {
-    let body = request.text().await?;
-    let Ok(update) = serde_json::from_str::<Update>(&body) else {
+async fn take_update(body: &str, env: &Env, cfg: &Config) -> Result<()> {
+    let Ok(update) = serde_json::from_str::<Update>(body) else {
         return Ok(());
     };
     let Some(origin) = update.origin() else {
@@ -102,6 +112,9 @@ async fn take_update(mut request: Request, env: &Env, cfg: &Config) -> Result<()
         return Ok(());
     }
 
+    if cfg.billing_enabled && billing::intercept(env, cfg, &update, &origin).await? {
+        return Ok(());
+    }
     let name = origin.session;
     let headers = Headers::new();
     headers.set(NAME_HEADER, &name)?;
@@ -109,7 +122,7 @@ async fn take_update(mut request: Request, env: &Env, cfg: &Config) -> Result<()
     let mut init = RequestInit::new();
     init.with_method(Method::Post)
         .with_headers(headers)
-        .with_body(Some(JsValue::from_str(&body)));
+        .with_body(Some(JsValue::from_str(body)));
     let forwarded = Request::new_with_init(&format!("https://session{UPDATE_PATH}"), &init)?;
     let stub = env.durable_object(SESSION_BINDING)?.get_by_name(&name)?;
     if let Err(error) = stub.fetch_with_request(forwarded).await {

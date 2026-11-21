@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Your account · agent-worker</title>
+  <link rel="stylesheet" href="/assets/style.css">
+  <script type="module" src="/assets/checkout.js"></script>
+</head>
+<body class="checkout">
+  <a class="skip" href="#main">Skip to content</a>
+  <header class="bar"><div class="bar-inner"><a class="brand" href="/" aria-label="agent-worker account"><span class="mark" aria-hidden="true">a</span>agent-worker</a><div class="bar-tools"><span class="bar-label">Customer account</span><button type="button" id="logout" class="secondary bar-action" hidden>Sign out</button></div></div></header>
+  <main id="main" tabindex="-1" class="wrap customer">
+    <noscript><p class="notice">Enable JavaScript to sign in and manage your token balance.</p></noscript>
+    <p class="notice" id="notice" role="status" aria-live="polite" hidden></p>
+    <section id="login-screen">
+      <div class="pricing-banner">
+        <div><h1>Token pricing</h1><p>Buy tokens for chat or spend them on a monthly membership.</p></div>
+        <div class="mascot" aria-hidden="true"><img src="/assets/wallet-cat.webp" width="446" height="526" alt=""></div>
+      </div>
+      <div class="welcome-grid">
+        <section class="panel stack sign-in">
+          <h2>Sign in</h2>
+          <p class="muted">Send <code>/account</code> in your private chat with the bot, then enter your one-time code.</p>
+          <form id="login" class="stack">
+            <label>Sign-in code <input name="code" type="text" required autocomplete="one-time-code" autocapitalize="none" spellcheck="false"></label>
+            <button>Continue</button>
+          </form>
+        </section>
+        <section class="panel public-pricing stack" aria-label="Current pricing">
+          <div id="public-offers" class="stack" aria-live="polite"><p class="muted">Loading current prices…</p></div>
+          <button class="secondary" type="button" id="retry-pricing" hidden>Retry pricing</button>
+        </section>
+      </div>
+    </section>
+
+    <section id="customer-account" hidden>
+      <div class="page-heading"><h1>Your tokens</h1><div class="actions"><span class="muted" id="user-id"></span><button id="refresh-account" type="button" class="secondary">Refresh</button></div></div>
+      <div class="balance wallet-strip">
+        <div><p>Available for chat</p><strong id="balance"></strong><span>tokens</span></div>
+        <div><p>Wallet</p><b id="wallet-balance"></b><span>tokens</span></div>
+        <div><p id="tier-label">Weekly allowance</p><b id="weekly-balance"></b><small id="next-refill"></small></div>
+        <img class="wallet-mascot" src="/assets/wallet-cat.webp" width="446" height="526" alt="">
+      </div>
+      <p id="access-message" class="panel" hidden></p>
+      <div class="customer-grid" id="buy-options">
+        <section id="top-up" class="panel plan-preview stack">
+          <h2>Buy tokens</h2>
+          <div id="wallet-rates"></div>
+          <form id="quote-form" class="stack">
+            <label>Amount (USD) <input required type="number" inputmode="decimal" min="0.01" max="10000" step="0.01" value="5.00" name="usd"></label>
+            <p id="quote-total" class="quote-tokens" aria-live="polite"></p>
+            <fieldset id="networks"><legend>Pay with</legend><div id="chain-options"></div></fieldset>
+            <button id="new-invoice">Get payment quote</button>
+            <p id="stars-help" class="hint" hidden></p>
+          </form>
+        </section>
+        <section class="panel plan-preview stack" id="membership">
+          <h2>Monthly membership</h2>
+          <div id="current-membership" hidden></div>
+          <div id="membership-offer" class="stack">
+            <p class="membership-price" id="plan-price"></p><p id="plan-title"></p>
+            <p class="hint" id="wallet-shortfall" hidden></p>
+            <button class="secondary" type="button" id="review-plan">Review subscription</button>
+            <div class="confirmation stack" id="plan-review" tabindex="-1" hidden>
+              <h3 id="confirm-heading">Confirm subscription</h3><p id="confirm-terms"></p>
+              <p id="pending-purchase" class="hint" hidden></p>
+              <div class="inline-form"><button type="button" id="confirm-plan">Subscribe</button><button type="button" class="secondary" id="dismiss-review">Back</button></div>
+            </div>
+          </div>
+        </section>
+      </div>
+      <section id="invoice-detail" class="panel stack" tabindex="-1" hidden>
+        <div class="section-heading"><h2>Invoice details</h2><button class="secondary" type="button" id="close-invoice">Close</button></div>
+        <div id="invoice-content"></div>
+      </section>
+      <section class="panel" id="past-memberships" hidden><h2>Membership records</h2><div id="my-subscriptions"></div></section>
+      <section class="panel"><h2>Invoices</h2><div id="invoices"></div></section>
+      <p class="muted" id="support"></p>
+    </section>
+  </main>
+</body>
+</html>

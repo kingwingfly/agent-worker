@@ -83,7 +83,7 @@ impl Bot {
         }
     }
 
-    async fn call(&self, method: &str, payload: Value) -> Result<Value> {
+    pub(crate) async fn call(&self, method: &str, payload: Value) -> Result<Value> {
         let body = JsValue::from_str(&payload.to_string());
         self.post(method, "application/json", body, RATE_LIMIT_RETRIES)
             .await
